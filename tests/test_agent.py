@@ -12,6 +12,7 @@ from agent_looplite import (
     AgentToolResult,
     AssistantMessage,
     MessageEnd,
+    RunLimits,
     SystemMessage,
     ToolResultMessage,
     UserMessage,
@@ -177,6 +178,46 @@ async def test_sync_listener_abort_runs_no_tools(mode: str) -> None:
     unsubscribe()
     await agent.prompt("再问")
     assert_pairs_sent(model.contexts[-1])
+
+
+@pytest.mark.parametrize("interrupt", ["timeout", "external_abort"])
+async def test_pending_tool_interrupted_after_listener_abort(interrupt: str) -> None:
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+
+    async def execute(call_id: str, params: dict[str, Any], on_update: Any) -> AgentToolResult:
+        await on_update("等待查询")
+        waiting.set()
+        await release.wait()
+        return AgentToolResult.of("完成")
+
+    agent = Agent(
+        model=ScriptedModel([tool_reply(call("lookup", id="a"))]),
+        tools=[AgentTool("lookup", "", {"type": "object"}, execute)],
+        tool_execution="sequential",
+        limits=RunLimits(tool_timeout=None, run_timeout=0.05 if interrupt == "timeout" else None),
+    )
+
+    def listener(event: Any) -> None:
+        if event.type == "tool_execution_update":
+            agent.abort()
+
+    agent.subscribe(listener)
+    task = asyncio.create_task(agent.prompt("查询"))
+    try:
+        await asyncio.wait_for(waiting.wait(), 1)
+        if interrupt == "external_abort":
+            agent.abort()
+            agent.abort()
+        done, _ = await asyncio.wait({task}, timeout=1)
+        assert task in done
+    finally:
+        release.set()
+        result = await task
+    assert result.reason == "aborted"
+    assert [(m.tool_call_id, m.is_error) for m in result.messages if m.role == "tool_result"] == [
+        ("a", True)
+    ]
 
 
 async def test_sync_listener_abort_stops_streaming() -> None:

@@ -186,6 +186,7 @@ class AgentRun:
         self._usage = Usage()
         self._turn: _Turn | None = None
         self._abort_reason: str | None = None
+        self._interrupt_sent = False
         self._started = False
         self._finished = False
         self._task: asyncio.Task[RunResult] | None = None
@@ -202,10 +203,13 @@ class AgentRun:
         运行会被当成已取消，结果丢失。任务还没开始执行时也只记原因：取消一个还没开始的协程，
         它的收尾代码一行都不会执行。
         """
-        if self._finished or self._abort_reason is not None:
+        if self._finished or self._interrupt_sent:
             return
-        self._abort_reason = reason
+        if self._abort_reason is None:
+            self._abort_reason = reason
         if self._started and self._task is not None and asyncio.current_task() is not self._task:
+            # 只打断一次，后续取消不能中断工具结果的补写。
+            self._interrupt_sent = True
             self._task.cancel()
 
     def _resume_after_abort(self) -> None:

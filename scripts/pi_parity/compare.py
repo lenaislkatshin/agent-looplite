@@ -55,8 +55,15 @@ def main() -> int:
         print(f"消息 {a['role']}：" + ("一致" if not different else f"不一致 {different}"))
         problems += bool(different)
 
-    number = 1
-    while (out / f"request-pi-{number}.json").exists():
+    def request_numbers(side: str) -> set[int]:
+        return {int(path.stem.rsplit("-", 1)[1]) for path in out.glob(f"request-{side}-*.json")}
+
+    pi_numbers = request_numbers("pi")
+    lo_numbers = request_numbers("looplite")
+    if pi_numbers != lo_numbers:
+        print(f"请求编号不一致：Pi {sorted(pi_numbers)}，本库 {sorted(lo_numbers)}")
+        problems += 1
+    for number in sorted(pi_numbers & lo_numbers):
         a = normalize_pi_request(json.loads((out / f"request-pi-{number}.json").read_text()))
         b = json.loads((out / f"request-looplite-{number}.json").read_text())
         fields = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
@@ -64,7 +71,6 @@ def main() -> int:
             f"第 {number} 次请求体：" + ("约定差异之外一致" if not fields else f"不一致 {fields}")
         )
         problems += bool(fields)
-        number += 1
 
     return 1 if problems else 0
 
