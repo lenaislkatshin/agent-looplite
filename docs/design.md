@@ -127,7 +127,7 @@ class ModelClient(Protocol):
 | `StreamDone(message)` | `done` | 最后一个事件。`message.stop_reason` 是 `stop`、`tool_use` 或 `length` |
 | `StreamError(message)` | `error` | 最后一个事件。`message.stop_reason` 是 `error` 或 `aborted`，带着出错前已收到的内容 |
 
-请求失败时不抛异常，发 `StreamError`，这和 Pi 一致。连接器的事件流在没有 `StreamDone` 或 `StreamError` 时就结束，循环把它当作 `error`。循环只执行 `StreamDone` 回复里的工具调用：`StreamError` 回复里的工具调用会被删掉，不执行。
+请求失败时不抛异常，发 `StreamError`，这和 Pi 一致。内置连接器在请求过程中遇到的任何异常，都记成 `error` 回复，`error_message` 写明异常类型和内容。连接器的事件流在没有 `StreamDone` 或 `StreamError` 时就结束，循环把它当作 `error`。循环只执行 `StreamDone` 回复里的工具调用：`StreamError` 回复里的工具调用会被删掉，不执行。
 
 连接器负责的事，循环都不管：
 
@@ -136,7 +136,7 @@ class ModelClient(Protocol):
 - 整理历史：跳过 `error` 和 `aborted` 的回复，按需要回传思考内容。用户消息和工具结果的内容拼成一个字符串发送；工具参数紧凑序列化，和 Pi 相同。
 - 分块：一条回复最多一个正文块和一个思考块，工具调用按分片里的 `index` 或 ID 归到各自的块。工具调用的每个分片都发一个 `toolcall_delta`，没有参数时增量为空字符串。所有块在流结束时按顺序结束。这些都和 Pi 相同。
 - 重试。还没收到任何内容时，连接错误、超时、408、409、429 和 5xx 会重试；已经发出增量后出错，不重试，发 `StreamError`。
-- 识别网关错误，包括 HTTP 200 但正文是错误的情况。
+- 识别网关错误，包括 HTTP 200 但正文是错误的情况。流式响应里不是 JSON 对象的分片跳过，和 Pi 相同。
 - 判定成功：只有明确的结束原因才算成功，规则同 Pi 的 `mapStopReason`。`stop`、`end` 是正常回答，`length` 是被截断，`tool_calls`、`function_call` 是调用工具；`network_error`、`content_filter` 等其他原因都是失败。响应没有结束原因，包括流正常关闭却没发结束原因，也算失败：这时已经拼出的工具参数可能看起来合法，执行它们可能产生实际副作用。确实不发结束原因的网关，设 `supports_finish_reason=False`。
 - 出网前检查：生成最终请求体后、发出前，调用 `on_payload`。
 
@@ -152,11 +152,11 @@ class ModelClient(Protocol):
 | `reasoning_field` | `reasoning_content` | 思考内容在响应里的字段名，有的网关叫 `reasoning` |
 | `supports_finish_reason` | `True` | 网关会发结束原因。设为 `False` 时，没有结束原因的响应按内容判定：有工具调用算 `tool_use`，否则算 `stop`。对应 Pi 的 `compat.supportsFinishReason` |
 | `replay_reasoning` | `False` | 是否把思考内容随历史回传。DeepSeek 在工具调用的轮次要求回传 |
-| `on_payload` | 无 | `async (body: dict) -> dict`，返回的请求体才会被发出。抛异常则这次请求以 `error` 结束，不重试 |
+| `on_payload` | 无 | `async (body: dict) -> dict \| None`，返回的请求体会被发出；返回 `None` 时发出原请求体，和 Pi 相同。抛异常则这次请求以 `error` 结束，不重试 |
 | `check_body` | 无 | `(body: dict) -> str \| None`，返回错误说明时当作请求失败。整轮的响应体和流式的每个分片都会检查。没填时，只识别没有 `choices` 却有 `error` 字段的响应 |
 | `max_retries` | 3 | 重试次数，不含第一次 |
 | `retry_base_delay` | 1 秒 | 第 n 次重试前等待 `retry_base_delay * 2**(n-1)` 秒 |
-| `timeout` | 120 秒 | 单次请求的超时 |
+| `timeout` | 120 秒 | httpx 的分阶段超时：连接、发送、等待连接池和每次读取各自不超过这个时间。流式时是相邻两次收到数据的最长间隔，不限制整次请求的总时长。传入 `http_client` 时不起作用，以它自己的设置为准 |
 | `settings` | 无 | 最后合并进请求体的其他字段，例如 `temperature`、`max_tokens` |
 | `http_client` | 无 | 传入自己的 `httpx.AsyncClient`，例如测试时用 `MockTransport`。不传时自己创建，`aclose()` 或 `async with` 时关闭 |
 
@@ -187,11 +187,21 @@ class AgentToolResult:
 
 `execute` 的三个参数依次是工具调用 ID、校验过的参数、报告进度的 async 函数，对应 Pi 的 `execute(toolCallId, params, signal, onUpdate)`。`await on_update(partial_result)` 发出 `ToolExecutionUpdate`；工具结束后再调用会被忽略。取消靠 asyncio 取消工具任务，所以没有 `signal` 参数。`label` 是给界面显示的名字。工具需要的数据库连接、可见范围等，由使用者用闭包或 `functools.partial` 绑定。`AgentToolResult.of(text, details)` 是便捷写法。
 
-一次运行开始前，循环检查每个工具的 `parameters` 本身是不是合法的 JSON Schema，工具名有没有重复，有问题直接抛异常。运行中用 `jsonschema` 按 `parameters` 校验参数，这和 pi-python 相同。
+一次运行开始前，循环检查每个工具的 `parameters` 本身是不是合法的 JSON Schema，工具名有没有重复，有问题直接抛异常。
+
+运行中，和 Pi 一样，先把参数复制一份，按 `parameters` 做类型宽容转换，再用 `jsonschema` 校验（`coercion.py`）。模型常把数字写成字符串、把单个值当成数组、给可选参数传 `null`，转换处理这几种情况：
+
+- 字符串转整数、数字、布尔值，例如 `"42"` 转成 42，`"true"` 转成 `True`；数字和布尔值转字符串。`"3.5"` 不能转成整数。
+- schema 要数组、收到单个值时，包成只有这一项的数组。
+- 可选属性收到 `null`，而它的 schema 不接受 `null` 时，当作没传。
+- `const`、`enum` 取转换后恰好相等的值；`anyOf`、`oneOf` 取第一个转换后能通过的分支。
+- 嵌套的对象、数组和 schema 内部的 `$ref` 逐层转换。
+
+转不了的值保持原样，由校验报错回传给模型。
 
 `@tool`（`function_tool.py`）从 async 函数的类型注解和 docstring 生成 `AgentTool`。参数格式由 pydantic 生成，不允许多余的字段；执行前再用 pydantic 转换一次，所以参数可以是 pydantic 模型。函数返回字符串时当作 `AgentToolResult.of(字符串)`。可以用 `@tool(name=..., label=..., description=..., execution_mode=...)` 覆盖默认值。pydantic 在这里相当于 Pi 里 TypeBox 的角色，是可选依赖，核心不需要它。
 
-以下情况都生成 `is_error=True` 的工具结果回传给模型，不结束运行。回传的文字和 Pi、pi-python 一致：
+以下情况都生成 `is_error=True` 的工具结果回传给模型，不结束运行。回传的文字和 Pi 相同，只有参数校验最多列 5 处问题，这条来自 pi-python：
 
 | 情况 | 回传内容 |
 |---|---|
@@ -213,7 +223,7 @@ class AgentToolResult:
 
 两种方式下，写进历史的工具结果和 `TurnEnd.tool_results` 都按调用顺序排列。
 
-每个调用的参数复制一份交给钩子和工具，和 Pi 相同。`before_tool_call` 修改参数会影响工具拿到的值，但历史里的工具调用仍是模型发来的原始参数。
+钩子和工具拿到的是转换过的参数副本，和 Pi 相同。`before_tool_call` 修改参数会影响工具拿到的值，但历史里的工具调用仍是模型发来的原始参数。
 
 ## 钩子
 
@@ -366,7 +376,8 @@ agent = Agent(
 | `messages.py` | 消息、内容块、`Usage`、序列化 | 无 |
 | `model.py` | `ModelClient` 协议、`ModelContext`、`StreamDelta`、`StreamDone`、`StreamError` | `messages` |
 | `events.py` | 事件、`PartialMessage` | `messages`、`model` |
-| `tools.py` | `AgentTool`、`AgentToolResult`、参数校验、执行 | `messages`、`model`、jsonschema |
+| `coercion.py` | 工具参数的类型宽容转换 | jsonschema |
+| `tools.py` | `AgentTool`、`AgentToolResult`、参数校验、执行 | `messages`、`model`、`coercion`、jsonschema |
 | `loop.py` | `agent_loop()`、`agent_loop_continue()`、`EventStream`、`AgentRun`、`AgentLoopConfig`、`RunLimits`、`RunResult`、钩子的类型 | 以上全部 |
 | `agent.py` | `Agent` | `loop` |
 | `chat_completions.py` | `ChatCompletionsClient` | `model`、`messages`、httpx |
@@ -387,12 +398,19 @@ agent = Agent(
 | 结束原因 | `agent_end` 只带消息 | `AgentEnd` 和 `RunResult` 带 `reason` | 有了运行上限，调用方需要知道是正常结束还是触发了上限 |
 | 模型 | 模型目录加 `streamFn`，模型目录管费用和上下文长度 | 只有 `ModelClient` | 本库不维护模型目录 |
 | 出网前检查 | `onPayload` 作为请求选项，由循环传给 `streamFn` | `on_payload` 是内置连接器的构造参数，自定义连接器自己负责 | 各网关的请求体格式不同，检查放在生成请求体的地方最准确 |
-| 钩子抛异常 | `before_tool_call` 抛异常时记为失败的工具结果，循环继续 | 运行以异常结束，抛出前补齐工具结果 | 钩子是使用者的代码，出错应让调用方知道，而不是交给模型处理 |
+| 钩子抛异常 | `before_tool_call`、`after_tool_call` 抛异常时记为失败的工具结果，循环继续；`Agent` 把运行中的其他异常记成一条 `error` 回复 | 运行以异常结束，抛出前补齐工具结果 | 钩子是使用者的代码，出错应让调用方知道，而不是交给模型处理 |
+| 出错和取消的回复 | 保留其中的工具调用，整理历史发给模型时跳过整条回复 | 删掉其中的工具调用；连接器同样跳过整条回复 | 历史里的工具调用都有结果，自定义连接器不用再处理没有结果的调用 |
+| 没有结果的工具调用 | 连接器整理历史时，给没有结果的调用补一条 `No result provided` | 不补 | 本库的运行保证调用和结果成对。只有外部导入或进程中断留下的历史才会缺结果，由调用方处理 |
+| 参数的类型宽容转换 | pi-schema 移植了 TypeBox 的全部转换规则，例如把 `"3.5"` 截断成整数 3，把必填参数的 `null` 转成 0 或 `"null"` | 只做“工具”一节列出的几种 | 其余规则会改掉模型的原意，不如报错让模型重发 |
+| 参数预处理 | 工具可以声明 `prepareArguments`，校验前改写原始参数 | 首版不做 | 常见的类型问题已由类型宽容转换处理 |
+| 参数校验的报错 | 列出全部问题 | 最多列 5 处，规则来自 pi-python | 参数多时报错过长 |
+| 思考字段 | 自动识别 `reasoning_content`、`reasoning`、`reasoning_text` | 只读 `reasoning_field` 指定的字段 | 同一个网关的字段名是固定的，由配置指定比逐个猜测明确 |
+| 系统提示词 | 系统提示词和工具声明存在历史开头的系统消息里 | `Agent.state.system_prompt` 单独存放，每次运行时加到历史最前面 | 本库不在历史里记录工具清单，见“工具清单的变化” |
 | 继续运行的末条消息 | 自定义消息经 `convertToLlm` 转成用户消息后，可以作为末条 | 跳过自定义消息，最后一条标准消息必须是用户消息或工具结果 | 首版没有需要自定义末条消息的场景，严格检查能更早发现调用错误 |
 | 工具清单的变化 | 在系统消息里记录工具清单的变化，随历史保存 | 工具清单不随历史保存，每次运行由调用方传入 | 首版的使用方式是每次运行传入固定的工具 |
 | 工具超时 | 没有 | `RunLimits.tool_timeout` | 一个卡住的工具不应拖住整次运行 |
 | 超过工具调用上限 | 没有上限 | 整轮不执行，规则来自 pi-python | 只执行一部分时，执行哪些由调用顺序偶然决定 |
-| `prepare_request` | 有 | 首版不做 | 用途可以由 `transform_context` 覆盖 |
+| 请求前和下一轮前的准备 | `prepareRequest`、`prepareNextTurn` 可以替换这次及之后请求的消息、工具、模型和思考等级 | 首版不做 | 首版没有按轮换模型或换工具的场景；只改这次请求的消息，用 `transform_context` |
 | 插话和排队 | `steer()`、`followUp()` | 首版不做 | 见 `CLAUDE.md` |
 | 多模态、思考等级、`thinkingBudgets`、`sessionId`、`getApiKey` | 有 | 首版不做 | 首版只做 Chat Completions，这些由连接器的 `settings` 和 `headers` 承担 |
 | Chat Completions 请求体 | 用户消息发内容块数组；按模型声明发 `max_completion_tokens`；发 `store: false` | 用户消息发字符串；最大输出长度和其他字段由使用者在 `settings` 里写 | 私有网关对字符串内容和最少字段的兼容性最好；`store` 是 OpenAI 专用字段 |
