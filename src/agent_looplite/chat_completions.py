@@ -30,7 +30,7 @@ from .messages import (
 )
 from .model import AssistantMessageEvent, ModelContext, StreamDelta, StreamDone, StreamError
 
-OnPayload = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+OnPayload = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]]
 CheckBody = Callable[[dict[str, Any]], str | None]
 
 RETRYABLE_STATUS = {408, 409, 429}
@@ -109,29 +109,35 @@ class ChatCompletionsClient:
         return self._stream(context)
 
     async def _stream(self, context: ModelContext) -> AsyncIterator[AssistantMessageEvent]:
+        """和 Pi 一样，任何失败都记成一条 `error` 回复，不向循环抛异常。"""
         builder = _ResponseBuilder(self.reasoning_field, self.model, self.supports_finish_reason)
-        body = self.build_body(context)
-        if self.on_payload is not None:
-            try:
-                body = await self.on_payload(body)
-            except Exception as exc:
-                yield builder.error(f"on_payload rejected the request: {exc}")
-                return
-        attempt = 0
-        while True:
-            try:
-                async for event in self._attempt(body, builder):
-                    yield event
-                return
-            except _Rejected as exc:
-                yield builder.error(str(exc))
-                return
-            except _Retryable as exc:
-                if builder.emitted or attempt >= self.max_retries:
+        try:
+            body = self.build_body(context)
+            if self.on_payload is not None:
+                try:
+                    checked = await self.on_payload(body)
+                except Exception as exc:
+                    yield builder.error(f"on_payload rejected the request: {exc}")
+                    return
+                if checked is not None:
+                    body = checked
+            attempt = 0
+            while True:
+                try:
+                    async for event in self._attempt(body, builder):
+                        yield event
+                    return
+                except _Rejected as exc:
                     yield builder.error(str(exc))
                     return
-                await asyncio.sleep(self.retry_base_delay * 2**attempt)
-                attempt += 1
+                except _Retryable as exc:
+                    if builder.emitted or attempt >= self.max_retries:
+                        yield builder.error(str(exc))
+                        return
+                    await asyncio.sleep(self.retry_base_delay * 2**attempt)
+                    attempt += 1
+        except Exception as exc:
+            yield builder.error(f"{type(exc).__name__}: {exc}")
 
     def build_body(self, context: ModelContext) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -228,6 +234,9 @@ class ChatCompletionsClient:
                     except ValueError:
                         yield builder.error(f"Malformed stream chunk: {payload[:MAX_ERROR_BODY]}")
                         return
+                    if not isinstance(chunk, dict):
+                        # 和 Pi 一样跳过不是 JSON 对象的分片。
+                        continue
                     problem = self._problem(chunk)
                     if problem is not None:
                         yield builder.error(problem)

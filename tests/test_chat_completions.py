@@ -233,6 +233,58 @@ async def test_on_payload_rewrites_and_rejects() -> None:
     assert "含身份证号" in events[-1].message.error_message
 
 
+async def test_on_payload_returning_none_keeps_the_body() -> None:
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "好"}, "finish_reason": "stop"}]}
+        )
+
+    async def check_only(body: dict[str, Any]) -> None:
+        assert "身份证" not in json.dumps(body, ensure_ascii=False)
+
+    events = await collect(client(handler, stream=False, on_payload=check_only))
+    assert seen[0]["messages"][-1]["content"] == "问"
+    assert isinstance(events[-1], StreamDone)
+
+
+async def test_non_object_chunks_are_skipped() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = sse(
+            {"choices": [{"delta": {"content": "好"}}]},
+            [1, 2],  # type: ignore[arg-type]
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        )
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    events = await collect(client(handler))
+    assert isinstance(events[-1], StreamDone)
+    assert events[-1].message.text == "好"
+
+
+async def test_unexpected_failures_become_error_replies() -> None:
+    requests = 0
+
+    def decoding_error(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        raise httpx.DecodingError("bad gzip")
+
+    def bad_choices(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": "不是数组"})
+
+    events = await collect(client(decoding_error))
+    assert isinstance(events[-1], StreamError)
+    assert events[-1].message.error_message == "DecodingError: bad gzip"
+    assert requests == 1
+
+    events = await collect(client(bad_choices, stream=False))
+    assert isinstance(events[-1], StreamError)
+    assert events[-1].message.error_message.startswith("AttributeError")
+
+
 async def test_history_conversion() -> None:
     sent: list[dict[str, Any]] = []
 
