@@ -1,0 +1,20 @@
+[project]
+name = "agent-looplite"
+version = "0.1.0"
+description = "通用的 Python agent 循环：可替换的模型连接器，工具和钩子扩展"
+readme = "README.md"
+authors = [
+    { name = "Shinei", email = "lenaislkatshin@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.9.20,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.4",
+]
