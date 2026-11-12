@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-agent-looplite 是通用的 Python agent 循环库：把对话发给模型，执行模型要求的工具，把结果交回模型，直到模型给出回答。导入名是 `agent_looplite`。项目处于设计阶段，还没有实现代码。
+agent-looplite 是通用的 Python agent 循环库：把对话发给模型，执行模型要求的工具，把结果交回模型，直到模型给出回答。导入名是 `agent_looplite`。项目处于设计阶段，还没有实现代码。接口设计见 `docs/design.md`，实现时以它为准，要改接口先改它。
 
 ## 定位
 
