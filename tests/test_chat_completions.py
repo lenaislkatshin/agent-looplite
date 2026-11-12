@@ -303,8 +303,12 @@ async def test_whole_body_reply_to_a_stream_request() -> None:
     assert events[-1].message.error_message.startswith("Response is not JSON: <html>")
 
 
+LINE_ENDINGS = [b"\n", b"\r\n", b"\r"]
+
+
+@pytest.mark.parametrize("ending", LINE_ENDINGS)
 @pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\x85"])
-async def test_only_newlines_end_a_stream_line(separator: str) -> None:
+async def test_only_sse_line_endings_end_a_stream_line(separator: str, ending: bytes) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = sse(
             {"choices": [{"delta": {"content": f"上{separator}下"}}]},
@@ -312,7 +316,7 @@ async def test_only_newlines_end_a_stream_line(separator: str) -> None:
         )
         assert separator.encode() in body
         return httpx.Response(
-            200, content=body.replace(b"\n", b"\r\n"), headers={"content-type": "text/event-stream"}
+            200, content=body.replace(b"\n", ending), headers={"content-type": "text/event-stream"}
         )
 
     events = await collect(client(handler))
@@ -320,15 +324,17 @@ async def test_only_newlines_end_a_stream_line(separator: str) -> None:
     assert events[-1].message.text == f"上{separator}下"
 
 
-async def test_stream_lines_split_across_network_chunks() -> None:
+@pytest.mark.parametrize("ending", LINE_ENDINGS)
+@pytest.mark.parametrize("size", [1, 7])
+async def test_stream_lines_split_across_network_chunks(size: int, ending: bytes) -> None:
     class Pieces(httpx.AsyncByteStream):
         async def __aiter__(self) -> Any:
             body = sse(
                 {"choices": [{"delta": {"content": "一行被拆进"}}]},
                 {"choices": [{"delta": {"content": "好几个网络包"}, "finish_reason": "stop"}]},
-            )
-            for start in range(0, len(body), 7):
-                yield body[start : start + 7]
+            ).replace(b"\n", ending)
+            for start in range(0, len(body), size):
+                yield body[start : start + size]
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, stream=Pieces(), headers={"content-type": "text/event-stream"})

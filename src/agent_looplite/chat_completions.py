@@ -306,17 +306,22 @@ class ChatCompletionsClient:
 
 
 async def _lines(response: httpx.Response) -> AsyncIterator[str]:
-    """按 `\\n` 和 `\\r\\n` 分行。
+    """按 SSE 规定的三种行结束符分行：`\\n`、`\\r\\n` 和单独的 `\\r`。
 
     不用 `response.aiter_lines()`：它还会在 U+2028、U+0085 这类字符处分行。这些字符可以原样出现
     在 JSON 字符串里，分片会被拆成两行，解析失败。
     """
     pending = ""
     async for text in response.aiter_text():
-        *lines, pending = (pending + text).split("\n")
+        pending += text
+        # 末尾的 `\\r` 可能是 `\\r\\n` 的前一半，留到下一块再判断。
+        held = "\r" if pending.endswith("\r") else ""
+        normalized = pending.removesuffix("\r").replace("\r\n", "\n").replace("\r", "\n")
+        *lines, pending = normalized.split("\n")
+        pending += held
         for line in lines:
-            yield line.removesuffix("\r")
-    if pending:
+            yield line
+    if pending.removesuffix("\r"):
         yield pending.removesuffix("\r")
 
 
