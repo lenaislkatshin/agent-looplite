@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from fractions import Fraction
 from typing import Any
 
 from jsonschema import Draft202012Validator
@@ -165,7 +166,9 @@ def _convert(type_: str, value: Any) -> Any:
             return _UNCHANGED
         if type_ == "number":
             return number
-        return int(number) if number.is_integer() else _UNCHANGED
+        # 按十进制原文判断是不是整数。浮点数会丢精度，把 "9007199254740993.0" 变成另一个整数。
+        exact = Fraction(text)
+        return exact.numerator if exact.denominator == 1 else _UNCHANGED
     if type_ == "boolean" and isinstance(value, str):
         return {"true": True, "false": False}.get(value.strip().lower(), _UNCHANGED)
     if type_ == "string" and isinstance(value, (int, float)):
