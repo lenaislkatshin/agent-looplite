@@ -400,7 +400,9 @@ class AgentRun:
         finally:
             close = getattr(stream, "aclose", None)
             if close is not None:
-                await close()
+                # 回复这时已经确定，关闭连接器时出的错不改变结果。
+                with contextlib.suppress(Exception):
+                    await close()
 
     async def _stream_reply(self, llm_messages: tuple[Message, ...]) -> AssistantMessage:
         partial = PartialMessage()

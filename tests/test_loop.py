@@ -18,6 +18,7 @@ from agent_looplite import (
     MessageUpdate,
     RunLimits,
     StreamDelta,
+    StreamDone,
     SystemMessage,
     TextContent,
     ToolCall,
@@ -314,6 +315,22 @@ async def test_connector_exception_becomes_error_reply() -> None:
     _, result = await run_events(FailsBeforeStreaming())
     assert result.reason == "error"
     assert result.messages[-1].error_message == "RuntimeError: 没有配置密钥"
+
+
+async def test_connector_exception_while_closing_keeps_the_reply() -> None:
+    class FailsOnClose:
+        def stream(self, context: Any) -> Any:
+            return self._stream()
+
+        async def _stream(self) -> Any:
+            try:
+                yield StreamDone(text_reply("答"))
+            finally:
+                raise RuntimeError("关闭连接失败")
+
+    _, result = await run_events(FailsOnClose())
+    assert result.reason == "completed"
+    assert result.messages[-1].text == "答"
 
 
 async def test_error_reply_drops_tool_calls() -> None:
