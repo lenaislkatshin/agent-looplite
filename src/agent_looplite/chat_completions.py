@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
@@ -36,6 +37,7 @@ CheckBody = Callable[[dict[str, Any]], str | None]
 RETRYABLE_STATUS = {408, 409, 429}
 SUCCESS_FINISH_REASONS = {"stop", "end", "length", "tool_calls", "function_call"}
 MAX_ERROR_BODY = 2000
+_VALID_ESCAPE = re.compile(r'\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})')
 
 
 class _Retryable(Exception):
@@ -462,19 +464,59 @@ class _ResponseBuilder:
 
 
 def parse_arguments(text: str) -> tuple[dict[str, Any], str | None]:
-    """严格解析完整的参数文本。
+    """解析完整的参数文本，规则同 Pi 的 `parseToolCallArguments`。
 
-    `NaN`、`Infinity` 不是合法 JSON，回传后再发给模型会出错，所以也拒绝。
+    解析失败时，先修复字符串里未转义的控制字符和不合法的反斜杠转义，再解析一次。模型在参数里
+    写多行文本或正则时常出这两类错。`NaN`、`Infinity` 不是合法 JSON，回传后再发给模型会出错，
+    所以也拒绝。
     """
     if not text.strip():
         return {}, None
     try:
-        value = json.loads(text, parse_constant=_reject_constant)
+        value = _loads_with_repair(text)
     except (ValueError, RecursionError) as exc:
         return {}, f"{exc}\n\nReceived arguments:\n{text}"
     if not isinstance(value, dict):
         return {}, f"Tool arguments must be a JSON object\n\nReceived arguments:\n{text}"
     return value, None
+
+
+def _loads_with_repair(text: str) -> Any:
+    try:
+        return json.loads(text, parse_constant=_reject_constant)
+    except ValueError:
+        repaired = _repair_string_literals(text)
+        if repaired == text:
+            raise
+        return json.loads(repaired, parse_constant=_reject_constant)
+
+
+def _repair_string_literals(text: str) -> str:
+    """把字符串里未转义的控制字符写成转义，把不合法转义前的反斜杠写成两个。字符串之外不动。"""
+    repaired: list[str] = []
+    in_string = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if not in_string:
+            repaired.append(char)
+            in_string = char == '"'
+        elif char == '"':
+            repaired.append(char)
+            in_string = False
+        elif char == "\\":
+            escape = _VALID_ESCAPE.match(text, index)
+            if escape is None:
+                repaired.append("\\\\")
+            else:
+                repaired.append(escape.group())
+                index = escape.end() - 1
+        elif char < " ":
+            repaired.append(json.dumps(char)[1:-1])
+        else:
+            repaired.append(char)
+        index += 1
+    return "".join(repaired)
 
 
 def _reject_constant(name: str) -> Any:

@@ -357,9 +357,19 @@ async def test_connection_drop_mid_stream_keeps_partial_text() -> None:
 def test_parse_arguments_rejects_non_json_values() -> None:
     assert parse_arguments('{"a": 1}') == ({"a": 1}, None)
     assert parse_arguments("") == ({}, None)
-    for bad in ['{"a": NaN}', '{"a": 1', "[1]"]:
+    for bad in ['{"a": NaN}', '{"a": 1', "[1]", '{"a": "没有闭合\n}']:
         arguments, error = parse_arguments(bad)
         assert arguments == {} and "Received arguments" in error
+
+
+def test_parse_arguments_repairs_string_literals() -> None:
+    # 同 Pi：字符串里未转义的控制字符和不合法的反斜杠转义，修复后再解析。
+    multiline = '{"sql": "select 1\nfrom t\twhere x"}'
+    assert parse_arguments(multiline) == ({"sql": "select 1\nfrom t\twhere x"}, None)
+    assert parse_arguments('{"pattern": "\\d+\\.txt"}') == ({"pattern": "\\d+\\.txt"}, None)
+    # 合法的转义不受影响，字符串之外的换行也不动。
+    valid = '{\n"a": "行\\n\\u4e2d\\\\",\n"b": "\\q"}'
+    assert parse_arguments(valid) == ({"a": "行\n中\\", "b": "\\q"}, None)
 
 
 async def test_only_explicit_finish_reasons_count_as_success() -> None:
