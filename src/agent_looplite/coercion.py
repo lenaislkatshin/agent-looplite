@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from fractions import Fraction
+from decimal import Decimal
 from typing import Any
 
 from jsonschema import Draft202012Validator
@@ -157,18 +157,17 @@ def _convert(type_: str, value: Any) -> Any:
     """转成 `type_` 的值，转不了时返回 `_UNCHANGED`。"""
     if type_ in ("integer", "number") and isinstance(value, str):
         text = value.strip()
-        if _INTEGER.fullmatch(text):
-            return int(text)
         if not _NUMBER.fullmatch(text):
             return _UNCHANGED
         number = float(text)
         if not math.isfinite(number):
             return _UNCHANGED
-        if type_ == "number":
+        if type_ == "number" and not _INTEGER.fullmatch(text):
             return number
-        # 按十进制原文判断是不是整数。浮点数会丢精度，把 "9007199254740993.0" 变成另一个整数。
-        exact = Fraction(text)
-        return exact.numerator if exact.denominator == 1 else _UNCHANGED
+        # 是不是整数按十进制原文判断：浮点数会丢精度，把 "9007199254740993.0" 变成另一个整数。
+        # Decimal 只存有效数字和指数，"1e-9999999" 这样的原文也不用构造很大的数。
+        exact = Decimal(text)
+        return int(exact) if exact == exact.to_integral_value() else _UNCHANGED
     if type_ == "boolean" and isinstance(value, str):
         return {"true": True, "false": False}.get(value.strip().lower(), _UNCHANGED)
     if type_ == "string" and isinstance(value, (int, float)):
