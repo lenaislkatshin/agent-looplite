@@ -119,6 +119,28 @@ async def test_abort_after_reply_before_tools_keeps_pairs() -> None:
     assert seen[-2:] == ["turn_end", "agent_end"]
 
 
+@pytest.mark.parametrize("interrupted", ["agent_start", "turn_start", "message_start"])
+async def test_abort_inside_a_listener_keeps_the_prompt(interrupted: str) -> None:
+    agent = Agent(model=ScriptedModel([text_reply("答")]))
+    entered = asyncio.Event()
+
+    async def listener(event: Any) -> None:
+        if event.type == interrupted and not entered.is_set():
+            entered.set()
+            await asyncio.sleep(5)
+
+    agent.subscribe(listener)
+    task = asyncio.create_task(agent.prompt("问题"))
+    await entered.wait()
+    agent.abort()
+    result = await task
+    assert result.reason == "aborted"
+    assert [m.role for m in result.messages] == ["user", "assistant"]
+    assert [m.role for m in agent.state.messages] == ["user", "assistant"]
+    assert agent.state.messages[0].content[0].text == "问题"
+    assert agent.state.messages[1].stop_reason == "aborted"
+
+
 async def test_config_error_does_not_leave_agent_busy() -> None:
     tool = echo_tool()
     agent = Agent(model=ScriptedModel([text_reply("好")]), tools=[tool, tool])

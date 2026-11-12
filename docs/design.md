@@ -316,7 +316,7 @@ def agent_loop_continue(context: AgentContext, config: AgentLoopConfig) -> Event
 
 `stream.cancel()`、`Agent.abort()` 或 `run_timeout` 到期时，行为和 Pi 相同。取消可能落在一轮中的任何位置，收尾按当时的进度处理：
 
-- 还没有模型回复，包括运行还没开始执行、正在调用 `transform_context` 时：不再发请求，记一条 `aborted` 回复。
+- 还没有模型回复，包括运行还没开始执行、正在调用 `transform_context` 时：不再发请求，记一条 `aborted` 回复。传入的提示还没写入历史的，先写入。
 - 正在请求模型：这次回复以 `aborted` 记进历史，保留已收到的正文和思考，删掉其中的工具调用。
 - 回复已写入，工具还没开始或正在执行：取消工具任务。已经完成的结果保留；没有结果的调用，每个补一条 `is_error=True`、内容为 `Operation aborted` 的结果。
 - 然后发 `TurnEnd` 和 `AgentEnd`，`reason` 是 `aborted` 或 `run_timeout`。
@@ -330,7 +330,7 @@ def agent_loop_continue(context: AgentContext, config: AgentLoopConfig) -> Event
 
 运行任务内部的监听函数调用 `abort()` 时只记录原因。此后从外部调用 `cancel()`、`abort()`，或 `run_timeout` 到期时，仍会打断正在等待的网络请求或工具。结束原因取第一次取消的原因。外部只打断一次，让循环能补齐工具结果。
 
-工具结果写入历史和记为“已写入”之间没有 await，所以取消或异常不会让一条结果只做了一半，补结果时也不会漏掉或重复。
+工具结果写入历史和记为“已写入”之间没有 await，所以取消或异常不会让一条结果只做了一半，补结果时也不会漏掉或重复。传入的提示也这样记录：取消落在 `Agent` 的监听函数里时，提示不会丢，也不会写两遍。
 
 这样工具调用和结果在历史里一定成对，用户可以接着问。工具被取消时副作用是否已经发生，循环无法知道。需要保证不重复执行的工具，自己处理幂等。
 

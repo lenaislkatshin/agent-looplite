@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
@@ -183,7 +184,8 @@ class AgentRun:
         config: AgentLoopConfig,
         emit: Emit,
     ) -> None:
-        self._prompts = tuple(prompts)
+        # 还没写入历史的提示。
+        self._pending_prompts: deque[AgentMessage] = deque(prompts)
         self._messages: list[AgentMessage] = list(context.messages)
         self._tools = ToolSet(context.tools)
         self._config = config
@@ -254,8 +256,10 @@ class AgentRun:
         await self._emit(AgentEnd(tuple(self._new), reason))
         return RunResult(tuple(self._new), reason, self._usage)
 
-    async def _add(self, message: AgentMessage, result_index: int | None = None) -> None:
-        """`result_index` 是工具结果在本轮的调用序号。
+    async def _add(
+        self, message: AgentMessage, result_index: int | None = None, *, prompt: bool = False
+    ) -> None:
+        """`result_index` 是工具结果在本轮的调用序号，`prompt` 表示这是待写入的第一条提示。
 
         写入历史和标记“已写入”之间没有 await，取消或异常不会只做了其中一半。
         """
@@ -265,21 +269,25 @@ class AgentRun:
         if result_index is not None:
             assert self._turn is not None
             self._turn.results[result_index] = message
+        if prompt:
+            self._pending_prompts.popleft()
         await self._emit(MessageEnd(message))
+
+    async def _add_prompts(self) -> None:
+        """写入还没写入历史的提示。取消后收尾时也调用，提示不会因为取消落在监听函数里而丢失。"""
+        while self._pending_prompts:
+            await self._add(self._pending_prompts[0], prompt=True)
 
     async def _loop(self) -> str:
         limits = self._config.limits
         requests = 0
         tool_calls = 0
-        prompts = self._prompts
         while True:
             if limits.max_model_requests is not None and requests >= limits.max_model_requests:
                 return "max_model_requests"
             turn = self._turn = _Turn()
             await self._emit(TurnStart())
-            for prompt in prompts:
-                await self._add(prompt)
-            prompts = ()
+            await self._add_prompts()
             assistant = await self._request()
             requests += 1
             self._usage += assistant.usage
@@ -445,14 +453,18 @@ class AgentRun:
         await self._emit(TurnEnd(turn.assistant, turn.ordered_results()))
 
     async def _close_turn(self) -> None:
-        """取消后收尾：取消可能落在一轮中的任何位置，包括回复已写入、工具还没开始的时候。
+        """取消后收尾：取消可能落在一轮中的任何位置，包括第一轮还没开始、回复已写入而工具还没开始的时候。
 
-        还没有回复就补一条 aborted 回复，没有结果的工具调用补上 `Operation aborted`，
-        再发 `TurnEnd`。
+        还没写入的提示照常写入，还没有回复就补一条 aborted 回复，没有结果的工具调用补上
+        `Operation aborted`，再发 `TurnEnd`。
         """
         turn = self._turn
-        if turn is None or turn.ended:
+        if turn is not None and turn.ended:
             return
+        if turn is None:
+            turn = self._turn = _Turn()
+            await self._emit(TurnStart())
+        await self._add_prompts()
         if turn.assistant is None:
             turn.assistant = self._aborted_reply(())
             await self._add(turn.assistant)
