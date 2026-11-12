@@ -117,7 +117,7 @@ async def test_sequential_tool_forces_whole_batch_sequential() -> None:
     ("bad_call", "expected"),
     [
         (call("missing", {"text": "x"}), "Tool missing not found"),
-        (call("echo", {"text": 1}), 'Validation failed for tool "echo"'),
+        (call("echo", {"text": ["x"]}), 'Validation failed for tool "echo"'),
         (
             ToolCall("c", "echo", {}, arguments_error="Expecting value"),
             'Invalid arguments for tool "echo": Expecting value',

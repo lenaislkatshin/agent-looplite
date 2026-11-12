@@ -7,6 +7,7 @@ pi-python 对照。
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -15,6 +16,7 @@ from typing import Any, Literal
 
 from jsonschema import Draft202012Validator
 
+from .coercion import coerce_arguments
 from .messages import TextContent, ToolCall
 from .model import ToolDeclaration
 
@@ -82,24 +84,32 @@ class ToolSet:
         entry = self._tools.get(name)
         return entry[0] if entry else None
 
-    def check_arguments(self, call: ToolCall) -> AgentToolResult | None:
-        """参数可以执行时返回 `None`，否则返回要回传给模型的错误结果。"""
+    def prepare_arguments(self, call: ToolCall) -> tuple[dict[str, Any], AgentToolResult | None]:
+        """返回交给钩子和工具的参数，以及参数不能执行时要回传给模型的错误结果。
+
+        和 Pi 一样，参数先复制一份，做类型宽容转换后再校验；历史里的工具调用保留模型发来的原始
+        参数。不能执行时参数为空。
+        """
         entry = self._tools.get(call.name)
         if entry is None:
-            return error_result(f"Tool {call.name} not found")
+            return {}, error_result(f"Tool {call.name} not found")
         if call.arguments_error is not None:
-            return error_result(f'Invalid arguments for tool "{call.name}": {call.arguments_error}')
+            return {}, error_result(
+                f'Invalid arguments for tool "{call.name}": {call.arguments_error}'
+            )
+        validator = entry[1]
+        arguments = coerce_arguments(copy.deepcopy(call.arguments), validator)
         problems = [
             f"  - {_error_path(error.json_path)}: {error.message}"
-            for error in entry[1].iter_errors(call.arguments)
+            for error in validator.iter_errors(arguments)
         ]
         if not problems:
-            return None
+            return arguments, None
         if len(problems) > MAX_REPORTED_PROBLEMS:
             more = len(problems) - MAX_REPORTED_PROBLEMS
             problems = [*problems[:MAX_REPORTED_PROBLEMS], f"  (and {more} more)"]
         received = json.dumps(call.arguments, ensure_ascii=False, indent=2)
-        return error_result(
+        return {}, error_result(
             f'Validation failed for tool "{call.name}":\n'
             + "\n".join(problems)
             + f"\n\nReceived arguments:\n{received}"

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import copy
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
@@ -501,16 +500,16 @@ class AgentRun:
         assert turn is not None
         limits = self._config.limits
         semaphore = asyncio.Semaphore(limits.max_concurrency)
-        # 每个调用复制一份参数交给钩子和工具，它们改参数不会改到模型发来的原始消息。
+        # 钩子和工具拿到的是转换过的参数副本，它们改参数不会改到模型发来的原始消息。
         arguments: dict[int, dict[str, Any]] = {}
 
         async def preflight(index: int) -> bool:
             call = calls[index]
             turn.started.add(index)
             await self._emit(ToolExecutionStart(call.id, call.name, call.arguments))
-            rejected = self._tools.check_arguments(call)
+            prepared, rejected = self._tools.prepare_arguments(call)
             if rejected is None:
-                arguments[index] = copy.deepcopy(call.arguments)
+                arguments[index] = prepared
                 if self._config.before_tool_call is not None:
                     decision = await self._config.before_tool_call(
                         BeforeToolCallContext(
