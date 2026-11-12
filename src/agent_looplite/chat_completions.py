@@ -37,6 +37,7 @@ CheckBody = Callable[[dict[str, Any]], str | None]
 RETRYABLE_STATUS = {408, 409, 429}
 SUCCESS_FINISH_REASONS = {"stop", "end", "length", "tool_calls", "function_call"}
 MAX_ERROR_BODY = 2000
+NO_TOOL_OUTPUT = "(no tool output)"
 _VALID_ESCAPE = re.compile(r'\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})')
 _SSE_LINE = re.compile(r"(?:data|event|id|retry)?:")
 
@@ -166,20 +167,30 @@ class ChatCompletionsClient:
         return body
 
     def _convert(self, message: Message) -> dict[str, Any] | None:
+        """返回 `None` 表示这条消息不发。助手回复和工具结果的规则同 Pi。"""
         if isinstance(message, SystemMessage):
             return {"role": "system", "content": message.content}
         if isinstance(message, UserMessage):
             return {"role": "user", "content": text_of(message.content)}
         if isinstance(message, ToolResultMessage):
+            text = "\n".join(block.text for block in message.content)
             return {
                 "role": "tool",
                 "tool_call_id": message.tool_call_id,
-                "content": text_of(message.content),
+                "content": text if text.strip() else NO_TOOL_OUTPUT,
             }
         if message.stop_reason in ("error", "aborted"):
             return None
-        converted: dict[str, Any] = {"role": "assistant", "content": message.text or None}
+        text = "".join(
+            block.text
+            for block in message.content
+            if isinstance(block, TextContent) and block.text.strip()
+        )
         calls = message.tool_calls
+        if not text and not calls:
+            # 有的网关不接受内容为空的消息。
+            return None
+        converted: dict[str, Any] = {"role": "assistant", "content": text or None}
         if calls:
             converted["tool_calls"] = [
                 {
@@ -194,8 +205,6 @@ class ChatCompletionsClient:
                 }
                 for call in calls
             ]
-        elif converted["content"] is None:
-            converted["content"] = ""
         if self.replay_reasoning:
             thinking = "".join(
                 b.thinking for b in message.content if isinstance(b, ThinkingContent)
@@ -560,7 +569,7 @@ def _parse_usage(raw: dict[str, Any]) -> Usage:
     )
     reasoning = (raw.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
     return Usage(
-        input=prompt - cached,
+        input=max(0, prompt - cached),
         output=completion,
         cache_read=cached,
         reasoning=reasoning,

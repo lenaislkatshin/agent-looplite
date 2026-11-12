@@ -81,7 +81,7 @@ await agent.prompt("今年 1 至 9 月集装箱吞吐量是多少？")
 
 `error` 和 `aborted` 的回复照样记进历史，保留中断前收到的正文，方便界面显示断在哪里。这类回复里的工具调用会被删掉，所以历史里的工具调用和结果总是成对的。连接器整理历史发给模型时，跳过这两类回复。
 
-`Usage` 记录 `input`、`output`、`cache_read`、`cache_write`、`reasoning`、`total_tokens`，可以相加。`input` 不含命中缓存的部分。不算费用。
+`Usage` 记录 `input`、`output`、`cache_read`、`cache_write`、`reasoning`、`total_tokens`，可以相加。`input` 不含命中缓存的部分，最小为 0。不算费用。
 
 序列化：`encode_messages(messages) -> list[dict]` 和 `decode_messages(data) -> tuple[AgentMessage, ...]`。每条带 `schema_version`，现在是 1。格式变化时升版本号，`decode_messages` 负责读旧版本。`details` 和 `CustomMessage.data` 原样写入，调用方保证它们能转成 JSON。
 
@@ -135,7 +135,7 @@ class ModelClient(Protocol):
 
 - 把流式分片拼成完整的 `AssistantMessage`。工具 ID 和名字不在第一片、参数分很多片，都在这里处理。
 - 解析工具参数，规则同 Pi。解析失败时，先修复字符串里未转义的控制字符（换行、制表符等）和不合法的反斜杠转义（例如 `\d`），再解析一次。仍然不是合法 JSON 对象时，写进 `arguments_error`，不抛异常。`NaN`、`Infinity` 也算不合法：它们不是 JSON，回传后再发给模型会出错。
-- 整理历史：跳过 `error` 和 `aborted` 的回复，按需要回传思考内容。用户消息和工具结果的内容拼成一个字符串发送；工具参数紧凑序列化，和 Pi 相同。
+- 整理历史。助手回复和工具结果的规则同 Pi：跳过 `error` 和 `aborted` 的回复，也跳过既没有正文也没有工具调用的回复，有的网关不接受内容为空的消息；工具结果的文本块用换行拼成一个字符串，没有文字时发 `(no tool output)`；工具参数紧凑序列化。用户消息的文本块直接拼成一个字符串。思考内容按 `replay_reasoning` 回传。
 - 分块：一条回复最多一个正文块和一个思考块，工具调用按分片里的 `index` 或 ID 归到各自的块。工具调用的每个分片都发一个 `toolcall_delta`，没有参数时增量为空字符串。所有块在流结束时按顺序结束。这些都和 Pi 相同。
 - 重试。还没收到任何内容时，连接错误、超时、408、409、429 和 5xx 会重试；已经发出增量后出错，不重试，发 `StreamError`。
 - 判断流式请求的响应是不是 SSE。看内容，不看 `content-type`：第一行有内容的行是 SSE 的字段行或注释行，就按 SSE 解析；否则把整个响应当作整段 JSON，按整轮返回处理。SSE 只按 `\n` 和 `\r\n` 分行，U+2028 这类字符可以原样出现在分片里。

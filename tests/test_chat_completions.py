@@ -386,6 +386,50 @@ async def test_history_conversion() -> None:
     assert "tools" not in sent[0]
 
 
+async def test_history_conversion_of_empty_replies_and_tool_results() -> None:
+    sent: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "好"}, "finish_reason": "stop"}]}
+        )
+
+    history = (
+        UserMessage.of("问"),
+        AssistantMessage((ThinkingContent("只有思考"), TextContent(" \n")), "stop"),
+        UserMessage.of("再问"),
+        AssistantMessage((ToolCall("c1", "search", {}), ToolCall("c2", "search", {})), "tool_use"),
+        ToolResultMessage("c1", "search", ()),
+        ToolResultMessage("c2", "search", (TextContent("第一块"), TextContent("第二块"))),
+    )
+    await collect(client(handler, stream=False, replay_reasoning=True), ModelContext(history, ()))
+    messages = sent[0]["messages"]
+    # 同 Pi：没有正文也没有工具调用的回复不发，空的工具结果发占位文字，文本块用换行拼接。
+    assert [m["role"] for m in messages] == ["user", "user", "assistant", "tool", "tool"]
+    assert messages[2]["content"] is None
+    assert messages[3]["content"] == "(no tool output)"
+    assert messages[4]["content"] == "第一块\n第二块"
+
+
+async def test_usage_input_is_never_negative() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "好"}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "prompt_cache_hit_tokens": 30,
+                },
+            },
+        )
+
+    events = await collect(client(handler, stream=False))
+    assert events[-1].message.usage == Usage(input=0, output=2, cache_read=30, total_tokens=12)
+
+
 async def test_headers_and_settings() -> None:
     seen: list[httpx.Request] = []
 
