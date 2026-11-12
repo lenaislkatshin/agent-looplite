@@ -1,7 +1,7 @@
 """工具的定义、参数校验和执行。
 
 工具出错一律变成 `is_error=True` 的结果回传给模型，不结束运行。回传的文字与 Pi 一致，方便和
-pi-python 对照。
+pi-python 对照；只有参数校验里每处问题的说明来自 jsonschema。
 """
 
 from __future__ import annotations

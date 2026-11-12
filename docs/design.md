@@ -156,7 +156,7 @@ class ModelClient(Protocol):
 | `supports_finish_reason` | `True` | 网关会发结束原因。设为 `False` 时，没有结束原因的响应按内容判定：有工具调用算 `tool_use`，否则算 `stop`。对应 Pi 的 `compat.supportsFinishReason` |
 | `replay_reasoning` | `False` | 是否把思考内容随历史回传。DeepSeek 在工具调用的轮次要求回传 |
 | `on_payload` | 无 | `async (body: dict) -> dict \| None`，返回的请求体会被发出；返回 `None` 时发出原请求体，和 Pi 相同。抛异常则这次请求以 `error` 结束，不重试 |
-| `check_body` | 无 | `(body: dict) -> str \| None`，返回错误说明时当作请求失败。整轮的响应体和流式的每个分片都会检查。没填时，只识别没有 `choices` 却有 `error` 字段的响应 |
+| `check_body` | 无 | `(body: dict) -> str \| None`，返回错误说明时当作请求失败。整轮的响应体和流式的每个分片都会检查。不管填没填，没有 `choices` 却有 `error` 字段的响应都当作请求失败 |
 | `max_retries` | 3 | 重试次数，不含第一次 |
 | `retry_base_delay` | 1 秒 | 第 n 次重试前等待 `retry_base_delay * 2**(n-1)` 秒 |
 | `timeout` | 120 秒 | httpx 的分阶段超时：连接、发送、等待连接池和每次读取各自不超过这个时间。流式时是相邻两次收到数据的最长间隔，不限制整次请求的总时长。传入 `http_client` 时不起作用，以它自己的设置为准 |
@@ -202,9 +202,9 @@ class AgentToolResult:
 
 转不了的值保持原样，由校验报错回传给模型。
 
-`@tool`（`function_tool.py`）从 async 函数的类型注解和 docstring 生成 `AgentTool`。参数格式由 pydantic 生成，不允许多余的字段；执行前再用 pydantic 转换一次，所以参数可以是 pydantic 模型。函数返回字符串时当作 `AgentToolResult.of(字符串)`。可以用 `@tool(name=..., label=..., description=..., execution_mode=...)` 覆盖默认值。pydantic 在这里相当于 Pi 里 TypeBox 的角色，是可选依赖，核心不需要它。
+`@tool`（`function_tool.py`）从 async 函数的类型注解和 docstring 生成 `AgentTool`。docstring 整段作为工具说明；参数的说明写成 `Annotated[str, Field(description="检索关键词")]`，会进入参数的 JSON Schema。参数格式由 pydantic 生成，不允许多余的字段；执行前再用 pydantic 转换一次，所以参数可以是 pydantic 模型。函数返回字符串时当作 `AgentToolResult.of(字符串)`。可以用 `@tool(name=..., label=..., description=..., execution_mode=...)` 覆盖默认值。pydantic 在这里相当于 Pi 里 TypeBox 的角色，是可选依赖，核心不需要它。
 
-以下情况都生成 `is_error=True` 的工具结果回传给模型，不结束运行。回传的文字和 Pi 相同，只有参数校验最多列 5 处问题，这条来自 pi-python：
+以下情况都生成 `is_error=True` 的工具结果回传给模型，不结束运行。回传的文字和 Pi 相同，参数校验除外：每处问题的说明和路径写法来自 `jsonschema`，例如路径写作 `edits[0].oldText`，Pi 写作 `edits.0.oldText`；最多列 5 处问题，这条来自 pi-python：
 
 | 情况 | 回传内容 |
 |---|---|
@@ -269,6 +269,8 @@ def agent_loop_continue(context: AgentContext, config: AgentLoopConfig) -> Event
 - `await stream.result() -> RunResult`：等运行结束。等待的一方被取消不会取消运行。
 - `stream.cancel()`：取消。
 
+迭代事件的一方被取消或提前退出，运行同样不会停，会继续请求模型和执行工具。服务端在请求断开时要自己调用 `stream.cancel()`，通常写在 `finally` 里。
+
 和 Pi 一样，底层的事件流只负责通知：事件放进无界队列，循环不等使用者处理完就继续执行，使用者不迭代也不会卡住循环。只能有一个迭代者。需要“处理完这条消息再执行工具”这种先后保证的，用 `Agent`。
 
 每一轮：
@@ -293,7 +295,7 @@ def agent_loop_continue(context: AgentContext, config: AgentLoopConfig) -> Event
 
 | `reason` | 含义 |
 |---|---|
-| `completed` | 模型给出回答，没有再调工具 |
+| `completed` | 模型给出回答，没有再调工具。回答因输出上限被截断时也是这个原因，这时最后一条回复的 `stop_reason` 是 `length` |
 | `terminated` | 本轮所有工具结果都带 `terminate` |
 | `finish_turn` | `finish_turn` 返回了 `end` |
 | `error` | 模型请求失败，最后一条回复带 `error_message` |
@@ -407,7 +409,8 @@ agent = Agent(
 | 没有结果的工具调用 | 连接器整理历史时，给没有结果的调用补一条 `No result provided` | 不补 | 本库的运行保证调用和结果成对。只有外部导入或进程中断留下的历史才会缺结果，由调用方处理 |
 | 参数的类型宽容转换 | pi-schema 移植了 TypeBox 的全部转换规则，例如把 `"3.5"` 截断成整数 3，把必填参数的 `null` 转成 0 或 `"null"` | 只做“工具”一节列出的几种 | 其余规则会改掉模型的原意，不如报错让模型重发 |
 | 参数预处理 | 工具可以声明 `prepareArguments`，校验前改写原始参数 | 首版不做 | 常见的类型问题已由类型宽容转换处理 |
-| 参数校验的报错 | 列出全部问题 | 最多列 5 处，规则来自 pi-python | 参数多时报错过长 |
+| 参数校验的报错 | 列出全部问题，说明由 pi-schema 生成 | 最多列 5 处，规则来自 pi-python；说明和路径写法由 `jsonschema` 生成 | 参数多时报错过长；校验库不同，措辞也不同 |
+| 重试的间隔 | 读响应头 `retry-after`、`retry-after-ms` 和 `x-should-retry`；没有时从 0.5 秒起翻倍，最长 8 秒，带随机抖动 | 按 `retry_base_delay * 2**(n-1)` 等待，不读响应头 | 首版只做固定的退避，网关要求按指定时间等待时再加 |
 | 思考字段 | 自动识别 `reasoning_content`、`reasoning`、`reasoning_text` | 只读 `reasoning_field` 指定的字段 | 同一个网关的字段名是固定的，由配置指定比逐个猜测明确 |
 | 流式请求收到整段 JSON | 一律按 SSE 解析，读不到分片，报没有结束原因 | 按整轮返回处理 | 网关常用整段 JSON 返回错误，按整段解析才能把错误内容报出来 |
 | 系统提示词 | 系统提示词和工具声明存在历史开头的系统消息里 | `Agent.state.system_prompt` 单独存放，每次运行时加到历史最前面 | 本库不在历史里记录工具清单，见“工具清单的变化” |

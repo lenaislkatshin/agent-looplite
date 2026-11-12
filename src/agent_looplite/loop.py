@@ -453,7 +453,7 @@ class AgentRun:
         await self._emit(TurnEnd(turn.assistant, turn.ordered_results()))
 
     async def _close_turn(self) -> None:
-        """取消后收尾：取消可能落在一轮中的任何位置，包括第一轮还没开始、回复已写入而工具还没开始的时候。
+        """取消后收尾。取消可能落在任何位置：第一轮还没开始，或者回复已写入、工具还没开始。
 
         还没写入的提示照常写入，还没有回复就补一条 aborted 回复，没有结果的工具调用补上
         `Operation aborted`，再发 `TurnEnd`。

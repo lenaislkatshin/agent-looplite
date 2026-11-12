@@ -43,7 +43,7 @@ _SSE_LINE = re.compile(r"(?:data|event|id|retry)?:")
 
 
 class _Retryable(Exception):
-    """还没收到任何内容时可以重试的失败：连接错误、超时、429 和 5xx。"""
+    """还没收到任何内容时可以重试的失败：连接错误、超时、408、409、429 和 5xx。"""
 
 
 class _Rejected(Exception):
