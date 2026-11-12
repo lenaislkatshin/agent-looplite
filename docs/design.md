@@ -127,7 +127,9 @@ class ModelClient(Protocol):
 | `StreamDone(message)` | `done` | 最后一个事件。`message.stop_reason` 是 `stop`、`tool_use` 或 `length` |
 | `StreamError(message)` | `error` | 最后一个事件。`message.stop_reason` 是 `error` 或 `aborted`，带着出错前已收到的内容 |
 
-请求失败时不抛异常，发 `StreamError`，这和 Pi 一致。内置连接器在请求过程中遇到的任何异常，都记成 `error` 回复，`error_message` 写明异常类型和内容。连接器的事件流在没有 `StreamDone` 或 `StreamError` 时就结束，循环把它当作 `error`。循环只执行 `StreamDone` 回复里的工具调用：`StreamError` 回复里的工具调用会被删掉，不执行。
+请求失败时不抛异常，发 `StreamError`，这和 Pi 一致。内置连接器在请求过程中遇到的任何异常，都记成 `error` 回复，`error_message` 写明异常类型和内容。
+
+循环不依赖连接器做到这一点。连接器抛出的异常，循环同样记成 `error` 回复，带着已收到的正文和思考；事件流在没有 `StreamDone` 或 `StreamError` 时就结束，也当作 `error`。所以不管用哪个连接器，请求失败都以 `reason` 为 `error` 结束，不向调用方抛异常。循环只执行 `StreamDone` 回复里的工具调用：`StreamError` 回复里的工具调用会被删掉，不执行。
 
 连接器负责的事，循环都不管：
 
@@ -400,6 +402,7 @@ agent = Agent(
 | 模型 | 模型目录加 `streamFn`，模型目录管费用和上下文长度 | 只有 `ModelClient` | 本库不维护模型目录 |
 | 出网前检查 | `onPayload` 作为请求选项，由循环传给 `streamFn` | `on_payload` 是内置连接器的构造参数，自定义连接器自己负责 | 各网关的请求体格式不同，检查放在生成请求体的地方最准确 |
 | 钩子抛异常 | `before_tool_call`、`after_tool_call` 抛异常时记为失败的工具结果，循环继续；`Agent` 把运行中的其他异常记成一条 `error` 回复 | 运行以异常结束，抛出前补齐工具结果 | 钩子是使用者的代码，出错应让调用方知道，而不是交给模型处理 |
+| 连接器抛异常 | 底层循环不处理，`Agent` 记成一条 `error` 回复 | 底层循环就记成 `error` 回复 | 两层入口对请求失败的处理应该相同，也不该依赖每个连接器自己做到不抛异常 |
 | 出错和取消的回复 | 保留其中的工具调用，整理历史发给模型时跳过整条回复 | 删掉其中的工具调用；连接器同样跳过整条回复 | 历史里的工具调用都有结果，自定义连接器不用再处理没有结果的调用 |
 | 没有结果的工具调用 | 连接器整理历史时，给没有结果的调用补一条 `No result provided` | 不补 | 本库的运行保证调用和结果成对。只有外部导入或进程中断留下的历史才会缺结果，由调用方处理 |
 | 参数的类型宽容转换 | pi-schema 移植了 TypeBox 的全部转换规则，例如把 `"3.5"` 截断成整数 3，把必填参数的 `null` 转成 0 或 `"null"` | 只做“工具”一节列出的几种 | 其余规则会改掉模型的原意，不如报错让模型重发 |

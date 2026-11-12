@@ -1,8 +1,8 @@
 """模型连接器的协议，对应 Pi 的 `StreamFn`。
 
 连接器把流式分片或整轮返回的响应整理成同一种事件，最后一个事件必须是 `StreamDone` 或
-`StreamError`。请求失败不抛异常，发 `StreamError`。拼接分片、解析工具参数、重试、识别网关
-错误、出网前检查都是连接器的事，循环不管。
+`StreamError`。请求失败不抛异常，发 `StreamError`；连接器仍然抛出的异常，循环记成 `error`
+回复。拼接分片、解析工具参数、重试、识别网关错误、出网前检查都是连接器的事，循环不管。
 """
 
 from __future__ import annotations

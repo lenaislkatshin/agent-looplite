@@ -38,7 +38,14 @@ from .messages import (
     ToolResultMessage,
     Usage,
 )
-from .model import ModelClient, ModelContext, StreamDelta, StreamDone, StreamError
+from .model import (
+    AssistantMessageEvent,
+    ModelClient,
+    ModelContext,
+    StreamDelta,
+    StreamDone,
+    StreamError,
+)
 from .tools import ABORTED_TEXT, AgentTool, AgentToolResult, ToolSet, error_result, run_tool
 
 TurnDecision = Literal["continue", "end"] | None
@@ -346,10 +353,37 @@ class AgentRun:
         await self._emit(MessageEnd(message))
         return message
 
+    async def _connector_events(
+        self, context: ModelContext, partial: PartialMessage
+    ) -> AsyncIterator[AssistantMessageEvent]:
+        """连接器的事件。连接器抛出的异常变成 `StreamError`，带着已收到的正文和思考。
+
+        请求失败因此总是以一条 `error` 回复结束，不依赖每个连接器自己做到不抛异常。
+        """
+        stream = None
+        try:
+            stream = self._config.model.stream(context)
+            async for event in stream:
+                yield event
+        except Exception as error:
+            yield StreamError(
+                AssistantMessage(
+                    content=partial.content(),
+                    stop_reason="error",
+                    error_message=f"{type(error).__name__}: {error}",
+                )
+            )
+        finally:
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()
+
     async def _stream_reply(self, llm_messages: tuple[Message, ...]) -> AssistantMessage:
         partial = PartialMessage()
         message: AssistantMessage | None = None
-        stream = self._config.model.stream(ModelContext(llm_messages, self._tools.declarations()))
+        stream = self._connector_events(
+            ModelContext(llm_messages, self._tools.declarations()), partial
+        )
         try:
             async for event in stream:
                 if isinstance(event, StreamDelta):
@@ -380,9 +414,7 @@ class AgentRun:
             self._resume_after_abort()
             message = self._aborted_reply(partial.content())
         finally:
-            close = getattr(stream, "aclose", None)
-            if close is not None:
-                await close()
+            await stream.aclose()
         if message is None:
             message = AssistantMessage(
                 content=partial.content(), stop_reason="error", error_message=STREAM_WITHOUT_RESULT

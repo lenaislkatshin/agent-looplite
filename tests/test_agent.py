@@ -239,6 +239,20 @@ async def test_sync_listener_abort_stops_streaming() -> None:
     assert agent.state.messages[-1].text == "abcd"
 
 
+async def test_listener_exception_while_streaming_ends_the_run() -> None:
+    # 连接器的异常记成 error 回复，监听函数的异常不算在内，照常向外抛。
+    agent = Agent(model=ScriptedModel([text_reply("abcdef")], chunk_size=2))
+
+    def listener(event: Any) -> None:
+        if event.type == "message_update" and event.kind == "text_delta":
+            raise RuntimeError("界面推送失败")
+
+    agent.subscribe(listener)
+    with pytest.raises(RuntimeError, match="界面推送失败"):
+        await agent.prompt("问")
+    assert not agent.state.is_streaming
+
+
 @pytest.mark.parametrize("action", ["abort", "raise"])
 async def test_interrupt_at_first_tool_result_keeps_every_result(action: str) -> None:
     runs: list[str] = []

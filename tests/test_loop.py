@@ -17,6 +17,7 @@ from agent_looplite import (
     MessageEnd,
     MessageUpdate,
     RunLimits,
+    StreamDelta,
     SystemMessage,
     TextContent,
     ToolCall,
@@ -286,6 +287,33 @@ async def test_model_error_is_recorded_and_ends_run() -> None:
     assert isinstance(last, AssistantMessage)
     assert last.stop_reason == "error" and last.error_message == "HTTP 500"
     assert last.text == "写了一半"
+
+
+async def test_connector_exception_becomes_error_reply() -> None:
+    class DropsMidStream:
+        def stream(self, context: Any) -> Any:
+            return self._stream()
+
+        async def _stream(self) -> Any:
+            yield StreamDelta("text_start", 0)
+            yield StreamDelta("text_delta", 0, "写了一半")
+            raise ConnectionError("网关断开")
+
+    events, result = await run_events(DropsMidStream())
+    assert result.reason == "error"
+    last = result.messages[-1]
+    assert isinstance(last, AssistantMessage)
+    assert last.stop_reason == "error" and last.error_message == "ConnectionError: 网关断开"
+    assert last.text == "写了一半"
+    assert types(events)[-2:] == ["turn_end", "agent_end"]
+
+    class FailsBeforeStreaming:
+        def stream(self, context: Any) -> Any:
+            raise RuntimeError("没有配置密钥")
+
+    _, result = await run_events(FailsBeforeStreaming())
+    assert result.reason == "error"
+    assert result.messages[-1].error_message == "RuntimeError: 没有配置密钥"
 
 
 async def test_error_reply_drops_tool_calls() -> None:
