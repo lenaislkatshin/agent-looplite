@@ -4,8 +4,9 @@ agent-looplite 是通用的 Python agent 循环库：把对话发给模型，执
 
 ## 定位
 
-- 面向所有 Python agent 开发者。公司项目是第一批使用者，但设计不以某个公司项目的需要为准。
-- 参照对象：Pi TS 原版 `earendil-works/pi` 的 `agent` 包，用于对齐接口和语义；`daidong/pi-agent-core-python`，用于行为对照和测试数据。不复制它们的代码。
+- 本库是 Pi TS 原版 `earendil-works/pi` 的 `agent` 包的轻量 Python 实现。结构、名字和语义对齐 Pi，和 Pi 不一样的地方写在 `docs/design.md`“与 Pi 的差异”，每处写明原因。
+- 和 `daidong/pi-agent-core-python`（pi-python）的区别是更小：只实现 `agent` 层，加一个 Chat Completions 连接器。不做多家厂商的连接器、OAuth、MCP、插件，也不提供多套入口。pi-python 用于行为对照和测试数据。不复制 Pi 和 pi-python 的代码。
+- 先服务自己的项目。功能按自己项目的实际需要加，但接口按通用库来设计，不写进某个项目的业务规则。
 - 设计是否合格，用两件事检验：接入一个协议特殊的新模型，只写连接器；接入一个新知识库，只写工具。两件事都不改循环。
 
 ## 分层
