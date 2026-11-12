@@ -119,22 +119,38 @@ async def test_abort_after_reply_before_tools_keeps_pairs() -> None:
     assert seen[-2:] == ["turn_end", "agent_end"]
 
 
-@pytest.mark.parametrize("interrupted", ["agent_start", "turn_start", "message_start"])
-async def test_abort_inside_a_listener_keeps_the_prompt(interrupted: str) -> None:
+@pytest.mark.parametrize(
+    ("interrupted", "role"),
+    [
+        ("agent_start", None),
+        ("turn_start", None),
+        ("message_start", "user"),
+        ("message_start", "assistant"),
+    ],
+)
+async def test_abort_inside_a_listener_keeps_the_prompt(interrupted: str, role: str | None) -> None:
     agent = Agent(model=ScriptedModel([text_reply("答")]))
     entered = asyncio.Event()
+    starts: list[str] = []
+
+    def record(event: Any) -> None:
+        if event.type == "message_start":
+            starts.append(event.role)
 
     async def listener(event: Any) -> None:
-        if event.type == interrupted and not entered.is_set():
+        # 每次收到这个事件都等很久：收尾时要是把它再发一次，运行就结束不了。
+        if event.type == interrupted and getattr(event, "role", None) == role:
             entered.set()
             await asyncio.sleep(5)
 
+    agent.subscribe(record)
     agent.subscribe(listener)
     task = asyncio.create_task(agent.prompt("问题"))
     await entered.wait()
     agent.abort()
-    result = await task
+    result = await asyncio.wait_for(task, 1)
     assert result.reason == "aborted"
+    assert starts == ["user", "assistant"]
     assert [m.role for m in result.messages] == ["user", "assistant"]
     assert [m.role for m in agent.state.messages] == ["user", "assistant"]
     assert agent.state.messages[0].content[0].text == "问题"
@@ -275,11 +291,17 @@ async def test_listener_exception_while_streaming_ends_the_run() -> None:
     assert not agent.state.is_streaming
 
 
-@pytest.mark.parametrize("action", ["abort", "raise"])
+@pytest.mark.parametrize("action", ["abort", "external_abort", "raise"])
 async def test_interrupt_at_first_tool_result_keeps_every_result(action: str) -> None:
     runs: list[str] = []
     model = ScriptedModel([tool_reply(call("t", id="a"), call("t", id="b")), text_reply("再答")])
     agent = Agent(model=model, tools=[counting_tool(runs)])
+    entered = asyncio.Event()
+    starts: list[str] = []
+
+    def record(event: Any) -> None:
+        if event.type == "message_start" and isinstance(event.message, ToolResultMessage):
+            starts.append(event.message.tool_call_id)
 
     async def listener(event: Any) -> None:
         message = getattr(event, "message", None)
@@ -290,16 +312,27 @@ async def test_interrupt_at_first_tool_result_keeps_every_result(action: str) ->
         ):
             if action == "abort":
                 agent.abort()
+            elif action == "external_abort":
+                entered.set()
+                await asyncio.sleep(5)
             else:
                 raise RuntimeError("监听函数出错")
 
+    agent.subscribe(record)
     unsubscribe = agent.subscribe(listener)
     if action == "abort":
         await agent.prompt("问")
+    elif action == "external_abort":
+        task = asyncio.create_task(agent.prompt("问"))
+        await entered.wait()
+        agent.abort()
+        await asyncio.wait_for(task, 1)
     else:
         with pytest.raises(RuntimeError):
             await agent.prompt("问")
     unsubscribe()
+    # 被打断的那条结果直接写完，开始事件不发第二次。
+    assert starts == ["a", "b"]
     results = [m for m in agent.state.messages if isinstance(m, ToolResultMessage)]
     assert [m.tool_call_id for m in results] == ["a", "b"]
     assert results[0].content[0].text == "ok:a"

@@ -162,6 +162,7 @@ class _Turn:
     """当前一轮的进度。取消或出错时据此补齐工具结果，保证历史里的工具调用和结果成对。"""
 
     assistant: AssistantMessage | None = None
+    reply_announced: bool = False
     started: set[int] = field(default_factory=set)
     outcomes: dict[int, AgentToolResult] = field(default_factory=dict)
     results: dict[int, ToolResultMessage] = field(default_factory=dict)
@@ -186,6 +187,8 @@ class AgentRun:
     ) -> None:
         # 还没写入历史的提示。
         self._pending_prompts: deque[AgentMessage] = deque(prompts)
+        # 开始事件已经发出、还没写入历史的消息，以及它作为工具结果时在本轮的调用序号。
+        self._adding: tuple[AgentMessage, int | None] | None = None
         self._messages: list[AgentMessage] = list(context.messages)
         self._tools = ToolSet(context.tools)
         self._config = config
@@ -257,26 +260,37 @@ class AgentRun:
         return RunResult(tuple(self._new), reason, self._usage)
 
     async def _add(
-        self, message: AgentMessage, result_index: int | None = None, *, prompt: bool = False
+        self, message: AgentMessage, result_index: int | None = None, *, announced: bool = False
     ) -> None:
-        """`result_index` 是工具结果在本轮的调用序号，`prompt` 表示这是待写入的第一条提示。
+        """`result_index` 是工具结果在本轮的调用序号，`announced` 表示开始事件已经发过。
 
-        写入历史和标记“已写入”之间没有 await，取消或异常不会只做了其中一半。
+        发 `MessageStart` 时被取消或出错，这条消息留在 `_adding` 里，收尾时由 `_finish_add`
+        写完。同一条消息的开始事件只发一次。
         """
-        await self._emit(MessageStart(message.role, message))
+        self._adding = (message, result_index)
+        if not announced:
+            await self._emit(MessageStart(message.role, message))
+        await self._finish_add()
+
+    async def _finish_add(self) -> None:
+        """写入开始事件已经发出的消息，再发 `MessageEnd`。
+
+        写入历史和清掉 `_adding` 之间没有 await，取消或异常不会让一条消息只写一半或写两遍。
+        """
+        if self._adding is None:
+            return
+        message, result_index = self._adding
+        self._adding = None
         self._messages.append(message)
         self._new.append(message)
         if result_index is not None:
             assert self._turn is not None
             self._turn.results[result_index] = message
-        if prompt:
-            self._pending_prompts.popleft()
         await self._emit(MessageEnd(message))
 
     async def _add_prompts(self) -> None:
-        """写入还没写入历史的提示。取消后收尾时也调用，提示不会因为取消落在监听函数里而丢失。"""
         while self._pending_prompts:
-            await self._add(self._pending_prompts[0], prompt=True)
+            await self._add(self._pending_prompts.popleft())
 
     async def _loop(self) -> str:
         limits = self._config.limits
@@ -343,6 +357,8 @@ class AgentRun:
             if not isinstance(message, Message):
                 raise TypeError(f"发给模型的消息必须是标准消息，收到 {type(message).__name__}")
 
+        assert self._turn is not None
+        self._turn.reply_announced = True
         await self._emit(MessageStart("assistant", None))
         if self._abort_reason is not None:
             # 和 Pi 一样，已经取消时不发请求，直接记一条 aborted 回复。
@@ -455,8 +471,8 @@ class AgentRun:
     async def _close_turn(self) -> None:
         """取消后收尾。取消可能落在任何位置：第一轮还没开始，或者回复已写入、工具还没开始。
 
-        还没写入的提示照常写入，还没有回复就补一条 aborted 回复，没有结果的工具调用补上
-        `Operation aborted`，再发 `TurnEnd`。
+        写了一半的消息和还没写入的提示照常写入，还没有回复就补一条 aborted 回复，没有结果的
+        工具调用补上 `Operation aborted`，再发 `TurnEnd`。
         """
         turn = self._turn
         if turn is not None and turn.ended:
@@ -464,10 +480,11 @@ class AgentRun:
         if turn is None:
             turn = self._turn = _Turn()
             await self._emit(TurnStart())
+        await self._finish_add()
         await self._add_prompts()
         if turn.assistant is None:
             turn.assistant = self._aborted_reply(())
-            await self._add(turn.assistant)
+            await self._add(turn.assistant, announced=turn.reply_announced)
         await self._complete_tool_results(ABORTED_TEXT)
         await self._end_turn()
 
@@ -497,6 +514,7 @@ class AgentRun:
     async def _complete_tool_results(self, text: str) -> None:
         turn = self._turn
         assert turn is not None and turn.assistant is not None
+        await self._finish_add()
         for index, call in enumerate(turn.assistant.tool_calls):
             if index in turn.results:
                 continue
