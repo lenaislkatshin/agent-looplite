@@ -1,13 +1,19 @@
 [project]
 name = "agent-looplite"
 version = "0.1.0"
-description = "通用的 Python agent 循环：可替换的模型连接器，工具和钩子扩展"
+description = "Pi agent 核心的轻量 Python 实现"
 readme = "README.md"
 authors = [
     { name = "Shinei", email = "lenaislkatshin@gmail.com" }
 ]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "httpx>=0.27",
+    "jsonschema>=4.18",
+]
+
+[project.optional-dependencies]
+pydantic = ["pydantic>=2.7"]
 
 [build-system]
 requires = ["uv_build>=0.9.20,<0.10.0"]
@@ -15,6 +21,25 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "pydantic>=2.14.3",
     "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
     "ruff>=0.17.4",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+# 中文注释和文档字符串按规范使用全角标点，不当作易混淆字符。
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.flake8-bugbear]
+# 两者都是不可变的 dataclass，用作默认值是安全的。
+extend-immutable-calls = ["agent_looplite.loop.RunLimits", "agent_looplite.messages.Usage"]

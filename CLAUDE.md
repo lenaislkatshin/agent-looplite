@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-agent-looplite 是通用的 Python agent 循环库：把对话发给模型，执行模型要求的工具，把结果交回模型，直到模型给出回答。导入名是 `agent_looplite`。项目处于设计阶段，还没有实现代码。接口设计见 `docs/design.md`，实现时以它为准，要改接口先改它。
+agent-looplite 是通用的 Python agent 循环库：把对话发给模型，执行模型要求的工具，把结果交回模型，直到模型给出回答。导入名是 `agent_looplite`。接口见 `docs/design.md`，改接口时同时改它。
 
 ## 定位
 
@@ -35,7 +35,9 @@ agent-looplite 是通用的 Python agent 循环库：把对话发给模型，执
 
 ## 验证
 
-- 正确性和性能用同一份录制的模型响应对比本库和 pi-python：事件序列、工具执行顺序、长回复时的 CPU 开销。
+- 单元测试用 `agent_looplite.testing.ScriptedModel` 和 httpx 的 `MockTransport`，不调真实模型。
+- `scripts/e2e.py` 用真实模型跑流式和整轮返回各一次，模型要连续调用工具才能回答。
+- `scripts/bench.py` 用同一份模拟响应对比本库和 pi-python 的 CPU 开销，结果记在 `docs/benchmark.md`。改动事件或连接器的流式路径后重跑。
 - 源码行数不作为设计目标。
 
 ## 开发
@@ -44,4 +46,8 @@ agent-looplite 是通用的 Python agent 循环库：把对话发给模型，执
 uv sync
 uv run ruff format . && uv run ruff check .
 uv run pytest -q
+LOOPLITE_BASE_URL=... LOOPLITE_API_KEY=... LOOPLITE_MODEL=... uv run python scripts/e2e.py   # 会把示例问题发给模型
+uv run python scripts/bench.py --deltas 4000 --runs 50
 ```
+
+ruff 放开了 `RUF001` 到 `RUF003`：中文注释按规范使用全角标点。
