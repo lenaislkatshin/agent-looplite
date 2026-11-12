@@ -1,6 +1,6 @@
 [project]
 name = "agent-looplite"
-version = "0.1.1"
+version = "0.1.2"
 description = "Pi agent 核心的轻量 Python 实现"
 readme = "README.md"
 authors = [
