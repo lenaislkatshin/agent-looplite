@@ -127,7 +127,11 @@ async def run_tool(
     on_update: ToolUpdate,
     timeout: float | None,
 ) -> tuple[AgentToolResult, float]:
-    """执行一个工具，返回结果和耗时（毫秒）。工具抛异常或超时都变成错误结果；取消照常向外传。"""
+    """执行一个工具，返回结果和耗时（毫秒）。工具抛异常或超时都变成错误结果。
+
+    运行被取消时，取消照常向外传。运行没被取消、工具自己抛出 `CancelledError` 时，例如它等待的
+    另一个任务被取消，和其他异常一样变成错误结果。
+    """
     started = time.monotonic()
     try:
         async with asyncio.timeout(timeout) as deadline:
@@ -136,6 +140,11 @@ async def run_tool(
         result = error_result(
             "Tool timed out" if deadline.expired() else str(exc) or "TimeoutError"
         )
+    except asyncio.CancelledError as exc:
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise
+        result = error_result(str(exc) or type(exc).__name__)
     except Exception as exc:
         result = error_result(str(exc) or type(exc).__name__)
     if not isinstance(result, AgentToolResult):

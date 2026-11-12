@@ -154,6 +154,26 @@ async def test_tool_exception_and_timeout_become_error_results() -> None:
     assert texts == ["数据库连不上", "Tool timed out"]
 
 
+@pytest.mark.parametrize("mode", ["parallel", "sequential"])
+async def test_tool_raising_cancelled_error_becomes_error_result(mode: str) -> None:
+    async def execute(call_id: str, params: dict[str, Any], on_update: Any) -> AgentToolResult:
+        # 运行没有被取消，工具等待的另一个任务被取消了。
+        other = asyncio.get_running_loop().create_future()
+        other.cancel()
+        await other
+        raise AssertionError
+
+    model = ScriptedModel([tool_reply(call("t", {"text": "x"}, id="a")), text_reply("换个办法")])
+    _, result = await run_events(
+        model, [AgentTool("t", "", ECHO_SCHEMA, execute)], tool_execution=mode
+    )
+    assert result.reason == "completed"
+    tool_result = result.messages[2]
+    assert isinstance(tool_result, ToolResultMessage)
+    assert tool_result.tool_call_id == "a" and tool_result.is_error
+    assert tool_result.content[0].text == "CancelledError"
+
+
 async def test_before_tool_call_blocks_and_after_tool_call_overrides() -> None:
     async def before(ctx: Any) -> BeforeToolCallResult | None:
         assert ctx.tool_call in ctx.assistant_message.tool_calls

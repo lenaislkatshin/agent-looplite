@@ -209,7 +209,7 @@ class AgentToolResult:
 | 工具名不存在 | `Tool {name} not found` |
 | `arguments_error` 不为空 | `Invalid arguments for tool "{name}": {原因}` |
 | 参数不符合 JSON Schema | `Validation failed for tool "{name}":`，列出最多 5 处问题和收到的参数 |
-| 工具抛异常 | 异常消息 |
+| 工具抛异常 | 异常消息，没有消息时是异常的类名。运行没被取消、工具自己抛出 `CancelledError` 时也算这一类 |
 | 超时 | `Tool timed out` |
 | `before_tool_call` 拦截 | 钩子给的原因，没给时是 `Tool execution was blocked` |
 | 回复因输出上限被截断（`stop_reason` 是 `length`） | 其中的工具调用都不执行，回传参数可能不完整、请重新调用的说明。这条规则来自 Pi |
