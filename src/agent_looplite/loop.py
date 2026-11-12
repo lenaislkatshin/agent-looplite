@@ -195,11 +195,17 @@ class AgentRun:
         return self._task
 
     def abort(self, reason: str = "aborted") -> None:
-        """任务还没开始执行时只记下原因：取消一个还没开始的协程，它的收尾代码一行都不会执行。"""
+        """和 Pi 的取消信号一样，先记下原因，循环在请求模型前、执行每个工具前检查它。
+
+        从别的任务调用时，再取消运行任务，打断正在等待的网络请求和工具。在运行任务内部调用时，
+        例如同步监听函数里，只记原因：任务要到下一次挂起才收到取消，如果在那之前就结束，整次
+        运行会被当成已取消，结果丢失。任务还没开始执行时也只记原因：取消一个还没开始的协程，
+        它的收尾代码一行都不会执行。
+        """
         if self._finished or self._abort_reason is not None:
             return
         self._abort_reason = reason
-        if self._started and self._task is not None:
+        if self._started and self._task is not None and asyncio.current_task() is not self._task:
             self._task.cancel()
 
     def _resume_after_abort(self) -> None:
@@ -238,10 +244,17 @@ class AgentRun:
         await self._emit(AgentEnd(tuple(self._new), reason))
         return RunResult(tuple(self._new), reason, self._usage)
 
-    async def _add(self, message: AgentMessage) -> None:
+    async def _add(self, message: AgentMessage, result_index: int | None = None) -> None:
+        """`result_index` 是工具结果在本轮的调用序号。
+
+        写入历史和标记“已写入”之间没有 await，取消或异常不会只做了其中一半。
+        """
         await self._emit(MessageStart(message.role, message))
         self._messages.append(message)
         self._new.append(message)
+        if result_index is not None:
+            assert self._turn is not None
+            self._turn.results[result_index] = message
         await self._emit(MessageEnd(message))
 
     async def _loop(self) -> str:
@@ -347,6 +360,9 @@ class AgentRun:
                             event.tool_name,
                         )
                     )
+                    if self._abort_reason is not None:
+                        message = self._aborted_reply(partial.content())
+                        break
                 elif isinstance(event, StreamDone):
                     message = event.message
                     break
@@ -411,14 +427,25 @@ class AgentRun:
     async def _repair_history(self, error: Exception) -> None:
         """钩子或监听函数抛异常时，运行到此为止，但历史要能直接用于下一次运行。
 
-        给已写入的回复里没有结果的工具调用补上错误结果。补的过程中再出错，只向外抛最初的异常。
+        给已写入的回复里没有结果的工具调用补上错误结果。补的事件仍然发给监听函数，但它们再抛的
+        异常不打断补写：出错的往往就是同一个监听函数，一中断，后面的结果就补不上了。向外只抛最初
+        的异常。
         """
         turn = self._turn
         if turn is None or turn.ended or turn.assistant is None:
             return
         text = f"Tool call was not completed: the run failed with {type(error).__name__}: {error}"
-        with contextlib.suppress(Exception):
+        emit = self._emit
+
+        async def emit_ignoring_errors(event: AgentEvent) -> None:
+            with contextlib.suppress(Exception):
+                await emit(event)
+
+        self._emit = emit_ignoring_errors
+        try:
             await self._complete_tool_results(text)
+        finally:
+            self._emit = emit
 
     async def _complete_tool_results(self, text: str) -> None:
         turn = self._turn
@@ -450,8 +477,7 @@ class AgentRun:
             details=result.details,
             is_error=result.is_error,
         )
-        self._turn.results[index] = message
-        await self._add(message)
+        await self._add(message, index)
 
     async def _fail_all(self, calls: tuple[ToolCall, ...], text: Callable[[ToolCall], str]) -> None:
         assert self._turn is not None
@@ -492,6 +518,8 @@ class AgentRun:
                             error_result(decision.reason or "Tool execution was blocked"),
                             terminate=decision.terminate,
                         )
+            if rejected is None and self._abort_reason is not None:
+                rejected = error_result(ABORTED_TEXT)
             if rejected is not None:
                 await self._finalize(index, call, rejected, None)
                 return False
@@ -510,6 +538,9 @@ class AgentRun:
                     )
 
             async with semaphore:
+                if self._abort_reason is not None:
+                    await self._finalize(index, call, error_result(ABORTED_TEXT), None)
+                    return
                 result, duration_ms = await run_tool(
                     tool, call.id, arguments[index], on_update, limits.tool_timeout
                 )
@@ -555,7 +586,7 @@ class AgentRun:
             self._resume_after_abort()
             await self._complete_tool_results(ABORTED_TEXT)
             return True
-        return False
+        return self._abort_reason is not None
 
 
 def _merge(result: AgentToolResult, override: AfterToolCallResult) -> AgentToolResult:

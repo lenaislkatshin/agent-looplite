@@ -12,5 +12,7 @@ trap 'kill $server; rm -rf "$here/node_modules"' EXIT
 sleep 1
 (cd "$here" && NO_PROXY='*' no_proxy='*' node pi_replay.mjs "$port" "$out")
 (cd "$here/../.." && NO_PROXY='*' no_proxy='*' uv run python scripts/pi_parity/looplite_replay.py "$port" "$out")
-uv run --project "$here/../.." python "$here/compare.py" "$out"
+status=0
+uv run --project "$here/../.." python "$here/compare.py" "$out" || status=$?
 echo "结果目录：$out"
+exit "$status"

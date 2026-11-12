@@ -8,6 +8,8 @@ import pytest
 from agent_looplite import (
     Agent,
     AgentBusyError,
+    AgentTool,
+    AgentToolResult,
     AssistantMessage,
     MessageEnd,
     SystemMessage,
@@ -139,3 +141,90 @@ async def test_hook_exception_keeps_agent_history_reusable() -> None:
     agent.before_tool_call = None
     result = await agent.prompt("再问")
     assert result.reason == "completed"
+
+
+def counting_tool(runs: list[str]) -> AgentTool:
+    async def execute(call_id: str, params: dict[str, Any], on_update: Any) -> AgentToolResult:
+        runs.append(call_id)
+        return AgentToolResult.of(f"ok:{call_id}")
+
+    return AgentTool("t", "", {"type": "object"}, execute)
+
+
+def assert_pairs_sent(context: Any) -> None:
+    """下一轮发给模型的每个工具调用，都紧跟着按顺序配对的结果。"""
+    messages = list(context.messages)
+    for position, message in enumerate(messages):
+        if isinstance(message, AssistantMessage) and message.tool_calls:
+            following = messages[position + 1 : position + 1 + len(message.tool_calls)]
+            assert [m.tool_call_id for m in following] == [c.id for c in message.tool_calls]
+
+
+@pytest.mark.parametrize("mode", ["parallel", "sequential"])
+async def test_sync_listener_abort_runs_no_tools(mode: str) -> None:
+    runs: list[str] = []
+    model = ScriptedModel([tool_reply(call("t", id="a"), call("t", id="b")), text_reply("再答")])
+    agent = Agent(model=model, tools=[counting_tool(runs)], tool_execution=mode)
+
+    def listener(event: Any) -> None:
+        if isinstance(event, MessageEnd) and isinstance(event.message, AssistantMessage):
+            agent.abort()
+
+    unsubscribe = agent.subscribe(listener)
+    result = await agent.prompt("问")
+    assert result.reason == "aborted"
+    assert runs == []
+    unsubscribe()
+    await agent.prompt("再问")
+    assert_pairs_sent(model.contexts[-1])
+
+
+async def test_sync_listener_abort_stops_streaming() -> None:
+    model = ScriptedModel([text_reply("abcdefghij")], chunk_size=2)
+    agent = Agent(model=model)
+    deltas = 0
+
+    def listener(event: Any) -> None:
+        nonlocal deltas
+        if event.type == "message_update" and event.kind == "text_delta":
+            deltas += 1
+            if deltas == 2:
+                agent.abort()
+
+    agent.subscribe(listener)
+    result = await agent.prompt("问")
+    assert result.reason == "aborted"
+    assert agent.state.messages[-1].stop_reason == "aborted"
+    assert agent.state.messages[-1].text == "abcd"
+
+
+@pytest.mark.parametrize("action", ["abort", "raise"])
+async def test_interrupt_at_first_tool_result_keeps_every_result(action: str) -> None:
+    runs: list[str] = []
+    model = ScriptedModel([tool_reply(call("t", id="a"), call("t", id="b")), text_reply("再答")])
+    agent = Agent(model=model, tools=[counting_tool(runs)])
+
+    async def listener(event: Any) -> None:
+        message = getattr(event, "message", None)
+        if (
+            event.type == "message_start"
+            and isinstance(message, ToolResultMessage)
+            and message.tool_call_id == "a"
+        ):
+            if action == "abort":
+                agent.abort()
+            else:
+                raise RuntimeError("监听函数出错")
+
+    unsubscribe = agent.subscribe(listener)
+    if action == "abort":
+        await agent.prompt("问")
+    else:
+        with pytest.raises(RuntimeError):
+            await agent.prompt("问")
+    unsubscribe()
+    results = [m for m in agent.state.messages if isinstance(m, ToolResultMessage)]
+    assert [m.tool_call_id for m in results] == ["a", "b"]
+    assert results[0].content[0].text == "ok:a"
+    await agent.prompt("再问")
+    assert_pairs_sent(model.contexts[-1])
