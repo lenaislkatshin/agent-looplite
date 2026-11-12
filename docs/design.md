@@ -133,7 +133,8 @@ class ModelClient(Protocol):
 
 - 把流式分片拼成完整的 `AssistantMessage`。工具 ID 和名字不在第一片、参数分很多片，都在这里处理。
 - 参数拼完不是合法 JSON 对象时，写进 `arguments_error`，不抛异常。`NaN`、`Infinity` 也算不合法：它们不是 JSON，回传后再发给模型会出错。
-- 整理历史：跳过 `error` 和 `aborted` 的回复，按需要回传思考内容。
+- 整理历史：跳过 `error` 和 `aborted` 的回复，按需要回传思考内容。用户消息和工具结果的内容拼成一个字符串发送；工具参数紧凑序列化，和 Pi 相同。
+- 分块：一条回复最多一个正文块和一个思考块，工具调用按分片里的 `index` 或 ID 归到各自的块。工具调用的每个分片都发一个 `toolcall_delta`，没有参数时增量为空字符串。所有块在流结束时按顺序结束。这些都和 Pi 相同。
 - 重试。还没收到任何内容时，连接错误、超时、408、409、429 和 5xx 会重试；已经发出增量后出错，不重试，发 `StreamError`。
 - 识别网关错误，包括 HTTP 200 但正文是错误的情况。
 - 判定成功：只有明确的结束原因才算成功，规则同 Pi 的 `mapStopReason`。`stop`、`end` 是正常回答，`length` 是被截断，`tool_calls`、`function_call` 是调用工具；`network_error`、`content_filter` 等其他原因都是失败。响应没有结束原因，包括流正常关闭却没发结束原因，也算失败：这时已经拼出的工具参数可能看起来合法，执行它们可能产生实际副作用。确实不发结束原因的网关，设 `supports_finish_reason=False`。
@@ -383,3 +384,4 @@ agent = Agent(
 | `prepare_request` | 有 | 首版不做 | 用途可以由 `transform_context` 覆盖 |
 | 插话和排队 | `steer()`、`followUp()` | 首版不做 | 见 `CLAUDE.md` |
 | 多模态、思考等级、`thinkingBudgets`、`sessionId`、`getApiKey` | 有 | 首版不做 | 首版只做 Chat Completions，这些由连接器的 `settings` 和 `headers` 承担 |
+| Chat Completions 请求体 | 用户消息发内容块数组；按模型声明发 `max_completion_tokens`；发 `store: false` | 用户消息发字符串；最大输出长度和其他字段由使用者在 `settings` 里写 | 私有网关对字符串内容和最少字段的兼容性最好；`store` 是 OpenAI 专用字段 |

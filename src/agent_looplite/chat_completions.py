@@ -178,7 +178,9 @@ class ChatCompletionsClient:
                     "type": "function",
                     "function": {
                         "name": call.name,
-                        "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                        "arguments": json.dumps(
+                            call.arguments, ensure_ascii=False, separators=(",", ":")
+                        ),
                     },
                 }
                 for call in calls
@@ -292,7 +294,9 @@ class _Block:
 class _ResponseBuilder:
     """把一次响应拼成 `AssistantMessage`。
 
-    流式分片和整轮返回走同一个出口，保证两种模式的结果一致。
+    流式分片和整轮返回走同一个出口，保证两种模式的结果一致。分块规则同 Pi 的 Chat Completions
+    连接器：一条回复最多一个正文块和一个思考块，工具调用按分片里的 `index` 或 ID 归到各自的块；
+    所有块在流结束时按顺序结束。
     """
 
     def __init__(self, reasoning_field: str, model: str, supports_finish_reason: bool) -> None:
@@ -300,8 +304,9 @@ class _ResponseBuilder:
         self.supports_finish_reason = supports_finish_reason
         self.model = model
         self.blocks: list[_Block] = []
-        self.open_index: int | None = None
-        self.tool_blocks: dict[int, int] = {}
+        self.text_blocks: dict[str, int] = {}
+        self.tools_by_position: dict[int, int] = {}
+        self.tools_by_id: dict[str, int] = {}
         self.usage = Usage()
         self.finish_reason: str | None = None
         self.emitted = False
@@ -329,47 +334,46 @@ class _ResponseBuilder:
 
     def _append_text(self, kind: str, text: str) -> list[StreamDelta]:
         events = []
-        if self.open_index is None or self.blocks[self.open_index].kind != kind:
-            events.extend(self._close_open())
+        index = self.text_blocks.get(kind)
+        if index is None:
             self.blocks.append(_Block(kind))
-            self.open_index = len(self.blocks) - 1
-            events.append(StreamDelta(f"{kind}_start", self.open_index))  # type: ignore[arg-type]
-        self.blocks[self.open_index].parts.append(text)
-        events.append(StreamDelta(f"{kind}_delta", self.open_index, text))  # type: ignore[arg-type]
+            index = self.text_blocks[kind] = len(self.blocks) - 1
+            events.append(StreamDelta(f"{kind}_start", index))  # type: ignore[arg-type]
+        self.blocks[index].parts.append(text)
+        events.append(StreamDelta(f"{kind}_delta", index, text))  # type: ignore[arg-type]
         return events
 
     def _append_tool(self, tool_delta: dict[str, Any]) -> list[StreamDelta]:
+        """每个工具调用分片都发一个 `toolcall_delta`，没有参数时增量为空字符串，和 Pi 一致。"""
         events = []
-        position = tool_delta.get("index", 0)
+        position = tool_delta.get("index")
+        call_id = tool_delta.get("id") or None
         function = tool_delta.get("function") or {}
-        if position not in self.tool_blocks:
-            events.extend(self._close_open())
-            self.blocks.append(_Block("toolcall"))
-            self.tool_blocks[position] = len(self.blocks) - 1
-            index = self.tool_blocks[position]
+        index = self.tools_by_position.get(position) if position is not None else None
+        if index is None and call_id is not None:
+            index = self.tools_by_id.get(call_id)
+        if index is None:
+            self.blocks.append(_Block("toolcall", id=call_id, name=function.get("name") or None))
+            index = len(self.blocks) - 1
             block = self.blocks[index]
-            block.id = tool_delta.get("id") or None
-            block.name = function.get("name") or None
             events.append(StreamDelta("toolcall_start", index, "", block.id, block.name))
-        index = self.tool_blocks[position]
         block = self.blocks[index]
-        block.id = block.id or tool_delta.get("id") or None
+        if position is not None:
+            self.tools_by_position.setdefault(position, index)
+        block.id = block.id or call_id
+        if block.id is not None:
+            self.tools_by_id.setdefault(block.id, index)
         block.name = block.name or function.get("name") or None
-        arguments = function.get("arguments")
-        if arguments:
-            block.parts.append(arguments)
-            events.append(StreamDelta("toolcall_delta", index, arguments))
+        arguments = function.get("arguments") or ""
+        block.parts.append(arguments)
+        events.append(StreamDelta("toolcall_delta", index, arguments))
         return events
 
-    def _close_open(self) -> list[StreamDelta]:
-        if self.open_index is None:
-            return []
-        index, self.open_index = self.open_index, None
-        return [StreamDelta(f"{self.blocks[index].kind}_end", index)]  # type: ignore[arg-type]
-
     def finish(self) -> list[AssistantMessageEvent]:
-        events: list[AssistantMessageEvent] = list(self._close_open())
-        events.extend(StreamDelta("toolcall_end", index) for index in self.tool_blocks.values())
+        events: list[AssistantMessageEvent] = [
+            StreamDelta(f"{block.kind}_end", index)  # type: ignore[arg-type]
+            for index, block in enumerate(self.blocks)
+        ]
         events.append(self._result())
         return events
 

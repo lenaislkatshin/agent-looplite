@@ -38,6 +38,7 @@ agent-looplite 是通用的 Python agent 循环库：把对话发给模型，执
 - 单元测试用 `agent_looplite.testing.ScriptedModel` 和 httpx 的 `MockTransport`，不调真实模型。
 - `scripts/e2e.py` 用真实模型跑流式和整轮返回各一次，模型要连续调用工具才能回答。
 - `scripts/bench.py` 用同一份模拟响应对比本库和 pi-python 的 CPU 开销，结果记在 `docs/benchmark.md`。改动事件或连接器的流式路径后重跑。
+- `scripts/pi_parity/run.sh <分片文件>` 把同一份录制的 SSE 分片回放给 Pi TS 原版和本库，逐条比对事件、工具执行、消息和请求体，结果记在 `docs/pi-parity.md`。改动循环、事件或连接器后重跑。录制的分片来自真实网关，不放进仓库。
 - 源码行数不作为设计目标。
 
 ## 开发

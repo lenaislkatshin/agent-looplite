@@ -97,16 +97,17 @@ async def test_stream_assembles_thinking_text_and_split_tool_call() -> None:
     assert requests[0]["stream_options"] == {"include_usage": True}
     assert requests[0]["tools"][0]["function"]["name"] == "search"
     kinds = [e.kind for e in events if isinstance(e, StreamDelta)]
+    # 同 Pi：所有块在流结束时按顺序结束，工具调用的每个分片都有一个 toolcall_delta。
     assert kinds == [
         "thinking_start",
         "thinking_delta",
-        "thinking_end",
         "text_start",
         "text_delta",
-        "text_end",
         "toolcall_start",
         "toolcall_delta",
         "toolcall_delta",
+        "thinking_end",
+        "text_end",
         "toolcall_end",
     ]
     done = events[-1]
@@ -255,7 +256,7 @@ async def test_history_conversion() -> None:
     messages = sent[0]["messages"]
     assert [m["role"] for m in messages] == ["user", "assistant", "tool", "user"]
     assert messages[1]["reasoning_content"] == "想"
-    assert messages[1]["tool_calls"][0]["function"]["arguments"] == '{"q": "x"}'
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == '{"q":"x"}'
     assert "tools" not in sent[0]
 
 
@@ -390,3 +391,46 @@ async def test_failed_response_never_runs_tools() -> None:
     result = await stream.result()
     assert result.reason == "error"
     assert executed == []
+
+
+async def test_one_text_block_and_empty_tool_argument_deltas() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = sse(
+            {"choices": [{"delta": {"content": "先说"}}]},
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "c",
+                                    "function": {"name": "search", "arguments": ""},
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]}}
+                ]
+            },
+            {"choices": [{"delta": {"content": "再说"}, "finish_reason": "tool_calls"}]},
+        )
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    events = await collect(client(handler))
+    deltas = [(e.kind, e.content_index, e.delta) for e in events if isinstance(e, StreamDelta)]
+    assert deltas == [
+        ("text_start", 0, ""),
+        ("text_delta", 0, "先说"),
+        ("toolcall_start", 1, ""),
+        ("toolcall_delta", 1, ""),
+        ("toolcall_delta", 1, "{}"),
+        ("text_delta", 0, "再说"),
+        ("text_end", 0, ""),
+        ("toolcall_end", 1, ""),
+    ]
+    assert events[-1].message.content == (TextContent("先说再说"), ToolCall("c", "search", {}))
