@@ -95,3 +95,47 @@ async def test_caller_cancellation_aborts_run_cleanly() -> None:
         await task
     assert agent.state.messages[-1].content[0].text == "Operation aborted"
     assert not agent.state.is_streaming
+
+
+async def test_abort_after_reply_before_tools_keeps_pairs() -> None:
+    model = ScriptedModel([tool_reply(call("echo", {"text": "a"}, id="c1"))])
+    agent = Agent(model=model, tools=[echo_tool()])
+    seen: list[str] = []
+
+    async def listener(event: Any) -> None:
+        seen.append(event.type)
+        if isinstance(event, MessageEnd) and isinstance(event.message, AssistantMessage):
+            agent.abort()
+            await asyncio.sleep(0)
+
+    agent.subscribe(listener)
+    result = await agent.prompt("问")
+    assert result.reason == "aborted"
+    assert [m.role for m in agent.state.messages] == ["user", "assistant", "tool_result"]
+    assert agent.state.messages[-1].content[0].text == "Operation aborted"
+    assert seen[-2:] == ["turn_end", "agent_end"]
+
+
+async def test_config_error_does_not_leave_agent_busy() -> None:
+    tool = echo_tool()
+    agent = Agent(model=ScriptedModel([text_reply("好")]), tools=[tool, tool])
+    with pytest.raises(ValueError, match="重复"):
+        await agent.prompt("问")
+    assert not agent.state.is_streaming
+    agent.state.tools = [tool]
+    result = await agent.prompt("问")
+    assert result.reason == "completed"
+
+
+async def test_hook_exception_keeps_agent_history_reusable() -> None:
+    async def before(ctx: Any) -> None:
+        raise RuntimeError("审计服务不可用")
+
+    model = ScriptedModel([tool_reply(call("echo", {"text": "a"})), text_reply("继续")])
+    agent = Agent(model=model, tools=[echo_tool()], before_tool_call=before)
+    with pytest.raises(RuntimeError):
+        await agent.prompt("问")
+    assert isinstance(agent.state.messages[-1], ToolResultMessage)
+    agent.before_tool_call = None
+    result = await agent.prompt("再问")
+    assert result.reason == "completed"

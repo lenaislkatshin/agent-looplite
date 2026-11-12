@@ -87,7 +87,7 @@ await agent.prompt("今年 1 至 9 月集装箱吞吐量是多少？")
 
 ## 事件
 
-事件的种类和顺序与 Pi 相同（`events.py`），每个类的 `type` 是 Pi 的事件名：
+事件的种类和顺序与 Pi 相同（`events.py`），每个类的 `type` 是 Pi 的事件名。一次运行的顺序是：`AgentStart`，`TurnStart`，传入提示的 `MessageStart` 和 `MessageEnd`，模型回复的 `MessageStart`、若干 `MessageUpdate`、`MessageEnd`，工具执行和工具结果消息，`TurnEnd`；之后每轮从 `TurnStart` 开始；最后是 `AgentEnd`。工具结果消息什么时候发，见“工具”。
 
 | 事件 | 字段 | 何时发出 |
 |---|---|---|
@@ -127,7 +127,7 @@ class ModelClient(Protocol):
 | `StreamDone(message)` | `done` | 最后一个事件。`message.stop_reason` 是 `stop`、`tool_use` 或 `length` |
 | `StreamError(message)` | `error` | 最后一个事件。`message.stop_reason` 是 `error` 或 `aborted`，带着出错前已收到的内容 |
 
-请求失败时不抛异常，发 `StreamError`，这和 Pi 一致。连接器的事件流在没有 `StreamDone` 或 `StreamError` 时就结束，循环把它当作 `error`。
+请求失败时不抛异常，发 `StreamError`，这和 Pi 一致。连接器的事件流在没有 `StreamDone` 或 `StreamError` 时就结束，循环把它当作 `error`。循环只执行 `StreamDone` 回复里的工具调用：`StreamError` 回复里的工具调用会被删掉，不执行。
 
 连接器负责的事，循环都不管：
 
@@ -136,6 +136,7 @@ class ModelClient(Protocol):
 - 整理历史：跳过 `error` 和 `aborted` 的回复，按需要回传思考内容。
 - 重试。还没收到任何内容时，连接错误、超时、408、409、429 和 5xx 会重试；已经发出增量后出错，不重试，发 `StreamError`。
 - 识别网关错误，包括 HTTP 200 但正文是错误的情况。
+- 判定成功：只有明确的结束原因才算成功，规则同 Pi 的 `mapStopReason`。`stop`、`end` 是正常回答，`length` 是被截断，`tool_calls`、`function_call` 是调用工具；`network_error`、`content_filter` 等其他原因都是失败。响应没有结束原因，包括流正常关闭却没发结束原因，也算失败：这时已经拼出的工具参数可能看起来合法，执行它们可能产生实际副作用。确实不发结束原因的网关，设 `supports_finish_reason=False`。
 - 出网前检查：生成最终请求体后、发出前，调用 `on_payload`。
 
 内置的 `ChatCompletionsClient`（`chat_completions.py`）的参数：
@@ -148,6 +149,7 @@ class ModelClient(Protocol):
 | `stream` | `True` | `False` 时整轮返回 |
 | `stream_usage` | `True` | 流式时请求 `stream_options.include_usage`，拿到用量。不支持这个字段的网关设为 `False` |
 | `reasoning_field` | `reasoning_content` | 思考内容在响应里的字段名，有的网关叫 `reasoning` |
+| `supports_finish_reason` | `True` | 网关会发结束原因。设为 `False` 时，没有结束原因的响应按内容判定：有工具调用算 `tool_use`，否则算 `stop`。对应 Pi 的 `compat.supportsFinishReason` |
 | `replay_reasoning` | `False` | 是否把思考内容随历史回传。DeepSeek 在工具调用的轮次要求回传 |
 | `on_payload` | 无 | `async (body: dict) -> dict`，返回的请求体才会被发出。抛异常则这次请求以 `error` 结束，不重试 |
 | `check_body` | 无 | `(body: dict) -> str \| None`，返回错误说明时当作请求失败。整轮的响应体和流式的每个分片都会检查。没填时，只识别没有 `choices` 却有 `error` 字段的响应 |
@@ -158,6 +160,8 @@ class ModelClient(Protocol):
 | `http_client` | 无 | 传入自己的 `httpx.AsyncClient`，例如测试时用 `MockTransport`。不传时自己创建，`aclose()` 或 `async with` 时关闭 |
 
 接一个协议特殊的平台，例如只收发文本的政务百炼，就自己实现 `ModelClient`。
+
+出网前检查是连接器的职责：内置连接器在发送前调用已配置的 `on_payload`；自定义连接器自己负责出网检查，循环不会替它做。有强制出网检查要求的项目，接入时核实实际使用的连接器在发送前做了检查。
 
 ## 工具
 
@@ -200,7 +204,15 @@ class AgentToolResult:
 | 这一轮的调用数会超过 `max_tool_calls` | 整轮都不执行，回传 `Entire tool batch exceeds remaining budget`。这条规则来自 pi-python |
 | 被取消 | `Operation aborted` |
 
-执行方式和 Pi 相同：`AgentLoopConfig.tool_execution` 默认是 `parallel`，并发数受 `RunLimits.max_concurrency` 限制。一轮中只要有一个工具声明了 `execution_mode="sequential"`，这一轮全部按顺序执行。并行时先按顺序做完每个调用的校验和 `before_tool_call`，再并发执行；`ToolExecutionEnd` 按完成顺序发出，工具结果消息和 `TurnEnd.tool_results` 按调用顺序排列。
+执行方式和 Pi 相同：`AgentLoopConfig.tool_execution` 默认是 `parallel`，并发数受 `RunLimits.max_concurrency` 限制。一轮中只要有一个工具声明了 `execution_mode="sequential"`，这一轮全部按顺序执行。
+
+- 顺序执行：每个调用依次校验、调用 `before_tool_call`、执行，结束后立即发出它的工具结果消息，再开始下一个。
+- 并行执行：先按顺序做完每个调用的校验和 `before_tool_call`，再并发执行。`ToolExecutionEnd` 按完成顺序发出；全部结束后，工具结果消息按调用顺序发出。
+- 回复被截断或超过工具调用上限时，每个调用依次发 `ToolExecutionStart`、`ToolExecutionEnd` 和结果消息。
+
+两种方式下，写进历史的工具结果和 `TurnEnd.tool_results` 都按调用顺序排列。
+
+每个调用的参数复制一份交给钩子和工具，和 Pi 相同。`before_tool_call` 修改参数会影响工具拿到的值，但历史里的工具调用仍是模型发来的原始参数。
 
 ## 钩子
 
@@ -220,7 +232,7 @@ class AgentToolResult:
 
 `finish_turn` 的语义和 Pi 相同：模型正常回复时，`continue` 保证再请求一次，`end` 在 `TurnEnd` 后立即结束；回复是 `error` 或 `aborted`，或者工具执行被取消时，返回值被忽略，运行一定结束。
 
-钩子抛异常时不吞掉，运行以异常结束：不发 `AgentEnd`，迭代事件和取结果都抛出同一个异常。钩子是使用者自己的代码，出错说明程序有问题，不该当作模型能修正的错误。
+钩子或 `Agent` 的监听函数抛异常时不吞掉，运行以异常结束：不发 `TurnEnd` 和 `AgentEnd`，迭代事件和取结果都抛出同一个异常。钩子是使用者自己的代码，出错说明程序有问题，不该当作模型能修正的错误。抛出前，给已写入的回复里没有结果的工具调用补上 `is_error=True` 的结果，写明运行因什么异常中断，所以历史仍可直接用于下一次运行。补结果时再出错，只向外抛最初的异常。
 
 ## 底层循环
 
@@ -247,9 +259,9 @@ def agent_loop_continue(context: AgentContext, config: AgentLoopConfig) -> Event
 
 每一轮：
 
-1. 已经取消则结束；请求数到了 `max_model_requests` 则结束。
-2. `transform_context`，`convert_to_llm`，交给连接器。
-3. 转发连接器的增量事件；回复结束后追加进消息列表。
+1. 请求数到了 `max_model_requests` 则结束。
+2. 发 `TurnStart`。第一轮在这里写入传入的 `prompts`。
+3. `transform_context`，`convert_to_llm`，交给连接器，转发增量事件；回复结束后追加进消息列表。已经取消时不发请求，直接记一条 `aborted` 回复。
 4. 回复是 `error` 或 `aborted`：调用 `finish_turn`，发 `TurnEnd`，结束。
 5. 回复没有工具调用：调用 `finish_turn`，发 `TurnEnd`。返回 `continue` 则回到第 1 步，否则结束。
 6. 执行工具，结果按调用顺序追加进消息列表。回复被截断，或这一轮的调用数会超过 `max_tool_calls` 时，整轮不执行，见“工具”。
@@ -288,13 +300,12 @@ def agent_loop_continue(context: AgentContext, config: AgentLoopConfig) -> Event
 
 ## 取消
 
-`stream.cancel()`、`Agent.abort()` 或 `run_timeout` 到期时，行为和 Pi 相同：
+`stream.cancel()`、`Agent.abort()` 或 `run_timeout` 到期时，行为和 Pi 相同。取消可能落在一轮中的任何位置，收尾按当时的进度处理：
 
+- 还没有模型回复，包括运行还没开始执行、正在调用 `transform_context` 时：不再发请求，记一条 `aborted` 回复。
 - 正在请求模型：这次回复以 `aborted` 记进历史，保留已收到的正文和思考，删掉其中的工具调用。
-- 正在执行工具：取消工具任务。已经完成的结果保留；没完成的，每个补一条 `is_error=True`、内容为 `Operation aborted` 的结果。
+- 回复已写入，工具还没开始或正在执行：取消工具任务。已经完成的结果保留；没有结果的调用，每个补一条 `is_error=True`、内容为 `Operation aborted` 的结果。
 - 然后发 `TurnEnd` 和 `AgentEnd`，`reason` 是 `aborted` 或 `run_timeout`。
-
-运行还没开始执行就被取消时，只记下原因，第一轮开始前结束。
 
 这样工具调用和结果在历史里一定成对，用户可以接着问。工具被取消时副作用是否已经发生，循环无法知道。需要保证不重复执行的工具，自己处理幂等。
 
@@ -330,7 +341,7 @@ agent = Agent(
 
 监听函数可以是同步或 async 的，和 Pi 一样按注册顺序依次等待完成。模型回复的 `MessageEnd` 处理完之后才开始执行工具，所以 `before_tool_call` 看到的消息列表里已经有这条回复。
 
-同一时间只能有一次运行，运行中再调用 `prompt()` 抛 `AgentBusyError`。调用 `prompt()` 的一方被取消时，按 `abort()` 处理：运行照常收尾，消息完整写回 `state` 后再向外抛出取消。
+同一时间只能有一次运行，运行中再调用 `prompt()` 抛 `AgentBusyError`。工具配置有错（schema 不合法、工具名重复）时，`prompt()` 直接抛异常，`Agent` 不进入运行状态。调用 `prompt()` 的一方被取消时，按 `abort()` 处理：运行照常收尾，消息完整写回 `state` 后再向外抛出取消。
 
 ## 测试支持
 
@@ -363,7 +374,10 @@ agent = Agent(
 | 工具的进度回调 | 同步函数 | async 函数 | `Agent` 要等监听函数处理完事件，同步回调里没法等 |
 | 结束原因 | `agent_end` 只带消息 | `AgentEnd` 和 `RunResult` 带 `reason` | 有了运行上限，调用方需要知道是正常结束还是触发了上限 |
 | 模型 | 模型目录加 `streamFn`，模型目录管费用和上下文长度 | 只有 `ModelClient` | 本库不维护模型目录 |
-| 出网前检查 | `onPayload` 作为请求选项，由循环传给 `streamFn` | `on_payload` 是连接器的构造参数 | 换连接器时检查跟着连接器走，调用方不会忘传 |
+| 出网前检查 | `onPayload` 作为请求选项，由循环传给 `streamFn` | `on_payload` 是内置连接器的构造参数，自定义连接器自己负责 | 各网关的请求体格式不同，检查放在生成请求体的地方最准确 |
+| 钩子抛异常 | `before_tool_call` 抛异常时记为失败的工具结果，循环继续 | 运行以异常结束，抛出前补齐工具结果 | 钩子是使用者的代码，出错应让调用方知道，而不是交给模型处理 |
+| 继续运行的末条消息 | 自定义消息经 `convertToLlm` 转成用户消息后，可以作为末条 | 跳过自定义消息，最后一条标准消息必须是用户消息或工具结果 | 首版没有需要自定义末条消息的场景，严格检查能更早发现调用错误 |
+| 工具清单的变化 | 在系统消息里记录工具清单的变化，随历史保存 | 工具清单不随历史保存，每次运行由调用方传入 | 首版的使用方式是每次运行传入固定的工具 |
 | 工具超时 | 没有 | `RunLimits.tool_timeout` | 一个卡住的工具不应拖住整次运行 |
 | 超过工具调用上限 | 没有上限 | 整轮不执行，规则来自 pi-python | 只执行一部分时，执行哪些由调用顺序偶然决定 |
 | `prepare_request` | 有 | 首版不做 | 用途可以由 `transform_context` 覆盖 |

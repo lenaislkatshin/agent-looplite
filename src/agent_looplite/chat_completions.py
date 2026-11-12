@@ -34,6 +34,7 @@ OnPayload = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 CheckBody = Callable[[dict[str, Any]], str | None]
 
 RETRYABLE_STATUS = {408, 409, 429}
+SUCCESS_FINISH_REASONS = {"stop", "end", "length", "tool_calls", "function_call"}
 MAX_ERROR_BODY = 2000
 
 
@@ -63,6 +64,7 @@ class ChatCompletionsClient:
         stream: bool = True,
         stream_usage: bool = True,
         reasoning_field: str = "reasoning_content",
+        supports_finish_reason: bool = True,
         replay_reasoning: bool = False,
         on_payload: OnPayload | None = None,
         check_body: CheckBody | None = None,
@@ -81,6 +83,7 @@ class ChatCompletionsClient:
         self.streaming = stream
         self.stream_usage = stream_usage
         self.reasoning_field = reasoning_field
+        self.supports_finish_reason = supports_finish_reason
         self.replay_reasoning = replay_reasoning
         self.on_payload = on_payload
         self.check_body = check_body
@@ -106,7 +109,7 @@ class ChatCompletionsClient:
         return self._stream(context)
 
     async def _stream(self, context: ModelContext) -> AsyncIterator[AssistantMessageEvent]:
-        builder = _ResponseBuilder(self.reasoning_field, self.model)
+        builder = _ResponseBuilder(self.reasoning_field, self.model, self.supports_finish_reason)
         body = self.build_body(context)
         if self.on_payload is not None:
             try:
@@ -292,8 +295,9 @@ class _ResponseBuilder:
     流式分片和整轮返回走同一个出口，保证两种模式的结果一致。
     """
 
-    def __init__(self, reasoning_field: str, model: str) -> None:
+    def __init__(self, reasoning_field: str, model: str, supports_finish_reason: bool) -> None:
         self.reasoning_field = reasoning_field
+        self.supports_finish_reason = supports_finish_reason
         self.model = model
         self.blocks: list[_Block] = []
         self.open_index: int | None = None
@@ -411,12 +415,20 @@ class _ResponseBuilder:
         return tuple(content)
 
     def _result(self) -> AssistantMessageEvent:
-        if self.finish_reason == "content_filter":
-            return self.error("Response blocked by the provider's content filter")
+        """只有明确的成功结束原因才算成功，规则同 Pi 的 `mapStopReason`。
+
+        `network_error` 这类原因、或者响应没有结束原因，都说明响应可能不完整。这时已经拼出的工具
+        参数可能看起来合法，执行它们可能产生实际副作用，所以一律当作失败。
+        """
+        reason = self.finish_reason
+        if reason is None and self.supports_finish_reason:
+            return self.error("Response ended without finish_reason")
+        if reason is not None and reason not in SUCCESS_FINISH_REASONS:
+            return self.error(f"Provider finish_reason: {reason}")
         content = self._content(include_tool_calls=True)
         has_calls = any(isinstance(block, ToolCall) for block in content)
         stop_reason: StopReason
-        if self.finish_reason == "length":
+        if reason == "length":
             stop_reason = "length"
         elif has_calls:
             stop_reason = "tool_use"

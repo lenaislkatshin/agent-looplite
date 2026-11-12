@@ -14,12 +14,14 @@ from agent_looplite import (
     AssistantMessage,
     BeforeToolCallResult,
     CustomMessage,
+    MessageEnd,
     MessageUpdate,
     RunLimits,
     SystemMessage,
     TextContent,
     ToolCall,
     ToolExecutionEnd,
+    ToolExecutionStart,
     ToolResultMessage,
     UserMessage,
     agent_loop,
@@ -32,11 +34,12 @@ from .helpers import ECHO_SCHEMA, echo_tool, run_events, types
 
 async def test_text_reply_event_sequence() -> None:
     events, result = await run_events(ScriptedModel([text_reply("你好")]))
+    # 顺序同 Pi：先 turn_start，再发首条提示消息。
     assert types(events) == [
         "agent_start",
+        "turn_start",
         "message_start",
         "message_end",
-        "turn_start",
         "message_start",
         "message_update",
         "message_update",
@@ -322,9 +325,13 @@ async def test_cancel_before_start() -> None:
         [UserMessage.of("问")], AgentContext(), AgentLoopConfig(model=ScriptedModel([]))
     )
     stream.cancel()
+    events = [event.type async for event in stream]
     result = await stream.result()
     assert result.reason == "aborted"
-    assert [m.role for m in result.messages] == ["user"]
+    # 和 Pi 一样，已经取消时不发请求，记一条 aborted 回复，轮次照常结束。
+    assert [m.role for m in result.messages] == ["user", "assistant"]
+    assert result.messages[-1].stop_reason == "aborted"
+    assert events[-2:] == ["turn_end", "agent_end"]
 
 
 async def test_hook_exception_propagates_without_agent_end() -> None:
@@ -407,3 +414,85 @@ async def test_invalid_schema_fails_before_running() -> None:
             AgentContext(tools=[bad]),
             AgentLoopConfig(model=ScriptedModel([])),
         )
+
+
+async def test_sequential_results_are_written_right_after_each_tool() -> None:
+    model = ScriptedModel(
+        [
+            tool_reply(call("a", {"text": "1"}, id="a"), call("b", {"text": "2"}, id="b")),
+            text_reply("好"),
+        ]
+    )
+    events, _ = await run_events(
+        model, [echo_tool("a"), echo_tool("b")], tool_execution="sequential"
+    )
+    trace = []
+    for event in events:
+        if isinstance(event, ToolExecutionStart | ToolExecutionEnd):
+            trace.append(f"{event.type}:{event.tool_call_id}")
+        elif isinstance(event, MessageEnd) and isinstance(event.message, ToolResultMessage):
+            trace.append(f"message_end:{event.message.tool_call_id}")
+    assert trace == [
+        "tool_execution_start:a",
+        "tool_execution_end:a",
+        "message_end:a",
+        "tool_execution_start:b",
+        "tool_execution_end:b",
+        "message_end:b",
+    ]
+
+
+async def test_parallel_results_are_written_after_all_tools() -> None:
+    model = ScriptedModel(
+        [
+            tool_reply(call("a", {"text": "1"}, id="a"), call("b", {"text": "2"}, id="b")),
+            text_reply("好"),
+        ]
+    )
+    events, _ = await run_events(model, [echo_tool("a"), echo_tool("b")])
+    kinds = [
+        e.type
+        for e in events
+        if e.type == "tool_execution_end"
+        or (e.type == "message_end" and isinstance(e.message, ToolResultMessage))
+    ]
+    assert kinds == ["tool_execution_end", "tool_execution_end", "message_end", "message_end"]
+
+
+async def test_hooks_get_a_copy_of_the_arguments() -> None:
+    seen: list[dict[str, Any]] = []
+
+    async def before(ctx: Any) -> None:
+        ctx.args["text"] = "改过"
+
+    async def execute(call_id: str, params: dict[str, Any], on_update: Any) -> AgentToolResult:
+        seen.append(params)
+        params["extra"] = True
+        return AgentToolResult.of("好")
+
+    model = ScriptedModel([tool_reply(call("t", {"text": "原值"})), text_reply("完")])
+    _, result = await run_events(
+        model, [AgentTool("t", "", ECHO_SCHEMA, execute)], before_tool_call=before
+    )
+    assert seen[0]["text"] == "改过"
+    assert result.messages[1].tool_calls[0].arguments == {"text": "原值"}
+
+
+async def test_hook_exception_leaves_reusable_history() -> None:
+    async def before(ctx: Any) -> None:
+        raise RuntimeError("审计服务不可用")
+
+    model = ScriptedModel([tool_reply(call("echo", {"text": "a"}, id="c1"))])
+    stream = agent_loop(
+        [UserMessage.of("问")],
+        AgentContext(tools=[echo_tool()]),
+        AgentLoopConfig(model=model, before_tool_call=before),
+    )
+    ends: list[Any] = []
+    with pytest.raises(RuntimeError, match="审计服务不可用"):
+        async for event in stream:
+            if event.type == "message_end":
+                ends.append(event.message)
+    assert isinstance(ends[-1], ToolResultMessage)
+    assert ends[-1].tool_call_id == "c1" and ends[-1].is_error
+    assert "RuntimeError: 审计服务不可用" in ends[-1].content[0].text

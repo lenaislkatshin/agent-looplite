@@ -132,11 +132,12 @@ class Agent:
             tool_execution=self.tool_execution,
             limits=self.limits,
         )
-        self.state.is_streaming = True
-        self.state.error_message = None
+        # 先构造运行再标记忙：工具配置有错时构造就会失败，Agent 不能因此一直处于忙的状态。
         self._run = AgentRun(
             prompts, AgentContext(history, self.state.tools), config, self._dispatch
         )
+        self.state.is_streaming = True
+        self.state.error_message = None
         self._task = self._run.start()
         try:
             return await asyncio.shield(self._task)

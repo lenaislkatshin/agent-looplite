@@ -213,7 +213,9 @@ async def test_on_payload_rewrites_and_rejects() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(json.loads(request.content))
-        return httpx.Response(200, json={"choices": [{"message": {"content": "好"}}]})
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "好"}, "finish_reason": "stop"}]}
+        )
 
     async def mask(body: dict[str, Any]) -> dict[str, Any]:
         body["messages"][-1]["content"] = "已脱敏"
@@ -235,7 +237,9 @@ async def test_history_conversion() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         sent.append(json.loads(request.content))
-        return httpx.Response(200, json={"choices": [{"message": {"content": "好"}}]})
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "好"}, "finish_reason": "stop"}]}
+        )
 
     history = (
         UserMessage.of("问"),
@@ -260,7 +264,9 @@ async def test_headers_and_settings() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return httpx.Response(200, json={"choices": [{"message": {"content": "好"}}]})
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "好"}, "finish_reason": "stop"}]}
+        )
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     model = ChatCompletionsClient(
@@ -301,3 +307,86 @@ def test_parse_arguments_rejects_non_json_values() -> None:
     for bad in ['{"a": NaN}', '{"a": 1', "[1]"]:
         arguments, error = parse_arguments(bad)
         assert arguments == {} and "Received arguments" in error
+
+
+async def test_only_explicit_finish_reasons_count_as_success() -> None:
+    tool_chunk = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [
+                        {"index": 0, "id": "c", "function": {"name": "search", "arguments": "{}"}}
+                    ]
+                }
+            }
+        ]
+    }
+
+    def respond(*tail: dict[str, Any]) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, content=sse(tool_chunk, *tail), headers={"content-type": "text/event-stream"}
+            )
+
+        return handler
+
+    events = await collect(
+        client(respond({"choices": [{"delta": {}, "finish_reason": "network_error"}]}))
+    )
+    assert isinstance(events[-1], StreamError)
+    assert events[-1].message.error_message == "Provider finish_reason: network_error"
+    assert events[-1].message.tool_calls == ()
+
+    events = await collect(client(respond()))
+    assert isinstance(events[-1], StreamError)
+    assert events[-1].message.error_message == "Response ended without finish_reason"
+
+    events = await collect(client(respond(), supports_finish_reason=False))
+    assert isinstance(events[-1], StreamDone)
+    assert events[-1].message.stop_reason == "tool_use"
+
+
+async def test_failed_response_never_runs_tools() -> None:
+    from agent_looplite import (
+        AgentContext,
+        AgentLoopConfig,
+        AgentTool,
+        AgentToolResult,
+        agent_loop,
+    )
+
+    executed: list[str] = []
+
+    async def execute(call_id: str, params: dict[str, Any], on_update: Any) -> AgentToolResult:
+        executed.append(call_id)
+        return AgentToolResult.of("好")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = sse(
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "c",
+                                    "function": {"name": "write", "arguments": "{}"},
+                                }
+                            ]
+                        },
+                        "finish_reason": "network_error",
+                    }
+                ]
+            }
+        )
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    stream = agent_loop(
+        [UserMessage.of("问")],
+        AgentContext(tools=[AgentTool("write", "", {"type": "object"}, execute)]),
+        AgentLoopConfig(model=client(handler)),
+    )
+    result = await stream.result()
+    assert result.reason == "error"
+    assert executed == []

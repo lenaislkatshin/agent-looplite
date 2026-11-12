@@ -112,7 +112,8 @@ def _error_path(json_path: str) -> str:
 
 async def run_tool(
     tool: AgentTool,
-    call: ToolCall,
+    tool_call_id: str,
+    arguments: dict[str, Any],
     on_update: ToolUpdate,
     timeout: float | None,
 ) -> tuple[AgentToolResult, float]:
@@ -120,7 +121,7 @@ async def run_tool(
     started = time.monotonic()
     try:
         async with asyncio.timeout(timeout) as deadline:
-            result = await tool.execute(call.id, call.arguments, on_update)
+            result = await tool.execute(tool_call_id, arguments, on_update)
     except TimeoutError as exc:
         result = error_result(
             "Tool timed out" if deadline.expired() else str(exc) or "TimeoutError"
