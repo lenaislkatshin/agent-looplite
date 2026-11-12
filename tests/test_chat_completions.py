@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 from agent_looplite import (
     AssistantMessage,
@@ -262,6 +263,79 @@ async def test_non_object_chunks_are_skipped() -> None:
     events = await collect(client(handler))
     assert isinstance(events[-1], StreamDone)
     assert events[-1].message.text == "好"
+
+
+@pytest.mark.parametrize("content_type", ["application/octet-stream", "text/plain", None])
+async def test_sse_is_recognized_by_content(content_type: str | None) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = sse(
+            {"choices": [{"delta": {"content": "好"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        )
+        headers = {"content-type": content_type} if content_type else {}
+        return httpx.Response(200, content=b": keep-alive\n\n" + body, headers=headers)
+
+    events = await collect(client(handler))
+    assert isinstance(events[-1], StreamDone)
+    assert events[-1].message.text == "好"
+
+
+async def test_whole_body_reply_to_a_stream_request() -> None:
+    def reply(content: str) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert json.loads(request.content)["stream"] is True
+            # 网关声明了 SSE，内容却是整段的。
+            return httpx.Response(
+                200, content=content, headers={"content-type": "text/event-stream"}
+            )
+
+        return handler
+
+    whole = {"choices": [{"message": {"content": "整段"}, "finish_reason": "stop"}]}
+    events = await collect(client(reply(json.dumps(whole, ensure_ascii=False, indent=2))))
+    assert isinstance(events[-1], StreamDone)
+    assert events[-1].message.text == "整段"
+
+    events = await collect(client(reply('{"error": {"message": "额度用完"}}')))
+    assert "额度用完" in events[-1].message.error_message
+
+    events = await collect(client(reply("<html>502 Bad Gateway</html>")))
+    assert events[-1].message.error_message.startswith("Response is not JSON: <html>")
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\x85"])
+async def test_only_newlines_end_a_stream_line(separator: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = sse(
+            {"choices": [{"delta": {"content": f"上{separator}下"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        )
+        assert separator.encode() in body
+        return httpx.Response(
+            200, content=body.replace(b"\n", b"\r\n"), headers={"content-type": "text/event-stream"}
+        )
+
+    events = await collect(client(handler))
+    assert isinstance(events[-1], StreamDone)
+    assert events[-1].message.text == f"上{separator}下"
+
+
+async def test_stream_lines_split_across_network_chunks() -> None:
+    class Pieces(httpx.AsyncByteStream):
+        async def __aiter__(self) -> Any:
+            body = sse(
+                {"choices": [{"delta": {"content": "一行被拆进"}}]},
+                {"choices": [{"delta": {"content": "好几个网络包"}, "finish_reason": "stop"}]},
+            )
+            for start in range(0, len(body), 7):
+                yield body[start : start + 7]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=Pieces(), headers={"content-type": "text/event-stream"})
+
+    events = await collect(client(handler))
+    assert isinstance(events[-1], StreamDone)
+    assert events[-1].message.text == "一行被拆进好几个网络包"
 
 
 async def test_unexpected_failures_become_error_replies() -> None:

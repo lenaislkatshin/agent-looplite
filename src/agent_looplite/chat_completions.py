@@ -38,6 +38,7 @@ RETRYABLE_STATUS = {408, 409, 429}
 SUCCESS_FINISH_REASONS = {"stop", "end", "length", "tool_calls", "function_call"}
 MAX_ERROR_BODY = 2000
 _VALID_ESCAPE = re.compile(r'\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})')
+_SSE_LINE = re.compile(r"(?:data|event|id|retry)?:")
 
 
 class _Retryable(Exception):
@@ -221,11 +222,18 @@ class ChatCompletionsClient:
                 return
             async with client.stream("POST", self.url, json=body, headers=self.headers) as response:
                 await _raise_for_status(response)
-                if "text/event-stream" not in response.headers.get("content-type", ""):
-                    async for event in self._from_body(await response.aread(), builder):
-                        yield event
-                    return
-                async for line in response.aiter_lines():
+                # 请求了流式，网关仍可能回整段 JSON，常见于用 HTTP 200 包着的错误。`content-type`
+                # 不可靠，所以看内容：第一行有内容的行不是 SSE 的字段行或注释行，就收集整个响应。
+                whole_body: list[str] | None = None
+                sniffed = False
+                async for line in _lines(response):
+                    if not sniffed and line.strip():
+                        sniffed = True
+                        if not _SSE_LINE.match(line):
+                            whole_body = []
+                    if whole_body is not None:
+                        whole_body.append(line)
+                        continue
                     if not line.startswith("data:"):
                         continue
                     payload = line[5:].strip()
@@ -245,6 +253,10 @@ class ChatCompletionsClient:
                         return
                     for event in builder.feed(chunk):
                         yield event
+                if whole_body is not None:
+                    async for event in self._from_body("\n".join(whole_body).encode(), builder):
+                        yield event
+                    return
                 for event in builder.finish():
                     yield event
         except httpx.TransportError as exc:
@@ -282,6 +294,21 @@ class ChatCompletionsClient:
                 f"Provider error: {json.dumps(data['error'], ensure_ascii=False)[:MAX_ERROR_BODY]}"
             )
         return None
+
+
+async def _lines(response: httpx.Response) -> AsyncIterator[str]:
+    """按 `\\n` 和 `\\r\\n` 分行。
+
+    不用 `response.aiter_lines()`：它还会在 U+2028、U+0085 这类字符处分行。这些字符可以原样出现
+    在 JSON 字符串里，分片会被拆成两行，解析失败。
+    """
+    pending = ""
+    async for text in response.aiter_text():
+        *lines, pending = (pending + text).split("\n")
+        for line in lines:
+            yield line.removesuffix("\r")
+    if pending:
+        yield pending.removesuffix("\r")
 
 
 async def _raise_for_status(response: httpx.Response) -> None:
